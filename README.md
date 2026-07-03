@@ -22,16 +22,23 @@ entirely.
 
 Requires a Rust toolchain (stable, edition 2024).
 
-Install straight to `~/.cargo/bin` (already on `PATH` for most Rust setups):
+Install from [crates.io](https://crates.io/crates/agent-kanban) straight to `~/.cargo/bin`
+(already on `PATH` for most Rust setups):
+
+```sh
+cargo install agent-kanban
+```
+
+Or build from this checked-out source instead — useful for unreleased changes not on
+crates.io yet:
 
 ```sh
 cargo install --path .
 ```
 
-This isn't published on crates.io, so `cargo install agent-kanban` (without `--path`) won't
-find it — `--path .` builds and installs directly from this checked-out source. Re-running
-the same command after pulling new changes rebuilds and overwrites the old install; unlike
-installing by name from crates.io, `--path` installs don't need `--force` to reinstall.
+`cargo install --path .` always rebuilds and overwrites the existing install, even with no
+changes. `cargo install agent-kanban` upgrades automatically when a newer version is
+published, but reinstalling the exact same version again needs `--force`.
 
 Or just build it without installing anywhere:
 
