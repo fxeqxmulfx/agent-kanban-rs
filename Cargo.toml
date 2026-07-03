@@ -1,0 +1,31 @@
+[package]
+name = "agent-kanban"
+version = "0.1.0"
+edition = "2024"
+description = "Kanban CLI for multiple concurrent LLM agents to coordinate on tasks, backed by SQLite"
+license = "MIT"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# repository/keywords/categories aren't meaningful for this private,
+# unpublished tool -- would rather leave them absent than fabricate a repo
+# URL or crates.io taxonomy tags.
+cargo_common_metadata = "allow"
+# rusqlite's optional WASM support (never compiled for this project's
+# actual target) pulls a separate hashbrown version via a sub-dependency;
+# not a real version conflict we can resolve from our own Cargo.toml.
+multiple_crate_versions = "allow"
+
+[dependencies]
+anyhow = "1.0.103"
+clap = { version = "4.6.1", features = ["derive"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde_json = "1.0.150"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
