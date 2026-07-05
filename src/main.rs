@@ -46,65 +46,94 @@ enum Command {
     /// Create a task. `--test` may be repeated; each is a JSON object
     /// `{"describe","input","output"}`. At least one `--test` is required.
     Add {
+        /// Task title.
         #[arg(long)]
         title: String,
+        /// Priority: low, medium, high, or urgent.
         #[arg(long)]
         priority: String,
+        /// Tag to attach (repeatable).
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// A test spec as JSON: {"describe","input","output"} (repeatable,
+        /// at least one required).
         #[arg(long = "test", required = true)]
         tests: Vec<String>,
     },
 
     /// List tasks, optionally filtered and sorted.
     List {
+        /// Filter by status.
         #[arg(long)]
         status: Option<String>,
+        /// Filter by tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Filter by claiming agent's name.
         #[arg(long)]
         executor: Option<String>,
+        /// Filter by priority.
         #[arg(long)]
         priority: Option<String>,
+        /// Sort order: priority (by severity, not alphabetically) or `created_at`.
         #[arg(long)]
         sort: Option<String>,
     },
 
     /// Show a single task.
-    Show { id: i64 },
+    Show {
+        /// Task id.
+        id: i64,
+    },
 
     /// Claim a task for a registered agent (atomic; fails if already claimed).
     Claim {
+        /// Task id.
         id: i64,
+        /// Registered agent name to claim it for.
         #[arg(long)]
         agent: String,
     },
 
     /// Move a task to a new status.
     Move {
+        /// Task id.
         id: i64,
+        /// New status: backlog, todo, `in_progress`, review, or done.
         #[arg(long)]
         status: String,
     },
 
     /// Un-claim a task.
-    Release { id: i64 },
+    Release {
+        /// Task id.
+        id: i64,
+    },
 
     /// Edit a task's fields in place. Blocked while claimed or done.
     Edit {
+        /// Task id.
         id: i64,
+        /// New title.
         #[arg(long)]
         title: Option<String>,
+        /// New priority: low, medium, high, or urgent.
         #[arg(long)]
         priority: Option<String>,
+        /// Replace tags with this set (repeatable).
         #[arg(long = "tag")]
         tags: Option<Vec<String>>,
+        /// Replace tests with this set (repeatable); same shape as `add`'s
+        /// `--test`.
         #[arg(long = "test")]
         tests: Option<Vec<String>>,
     },
 
     /// Hard-delete a task. Blocked while claimed or done.
-    Remove { id: i64 },
+    Remove {
+        /// Task id.
+        id: i64,
+    },
 
     /// Board overview: task counts per status column plus each registered
     /// agent's current claimed-task count.
@@ -114,11 +143,17 @@ enum Command {
 #[derive(Subcommand)]
 enum AgentAction {
     /// Register a new agent name.
-    Register { name: String },
+    Register {
+        /// Agent name to register.
+        name: String,
+    },
     /// List registered agents.
     List,
     /// Remove an agent, auto-releasing any tasks it holds.
-    Remove { name: String },
+    Remove {
+        /// Agent name to remove.
+        name: String,
+    },
 }
 
 fn main() {
