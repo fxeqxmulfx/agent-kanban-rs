@@ -1,6 +1,6 @@
 [package]
 name = "agent-kanban"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Kanban CLI for multiple concurrent LLM agents to coordinate on tasks, backed by SQLite"
 license = "MIT"
