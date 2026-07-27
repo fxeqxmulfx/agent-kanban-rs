@@ -112,7 +112,11 @@ fn list_inner(
     }
     if let Some(executor) = executor {
         params.push(Box::new(executor));
-        conditions.push(format!("agents.name = ?{}", params.len()));
+        conditions.push(format!(
+            "agents.name = ?{} AND tasks.status != 'done' \
+             AND tasks.lease_expires_at > datetime('now')",
+            params.len()
+        ));
     }
 
     let mut sql = crate::commands::TASK_SELECT.to_string();
@@ -156,9 +160,7 @@ fn show_inner(conn: &Connection, id: i64) -> Result<Value> {
 
 /// `agent-kanban edit <id> [--title T] [--priority P] [--tag t]... [--test '<json>']...`
 /// Replaces the given field(s) in place — any `--tag`/`--test` flags replace the
-/// whole array, not append. Fails if `executor IS NOT NULL` (must `release`
-/// first) OR `status = 'done'` (finished tasks are immutable). Same `tests`
-/// shape validation as `add`. Must bump `updated_at`. See todo.md section 3.
+/// whole array, not append.
 pub fn edit(
     id: i64,
     title: Option<String>,
@@ -208,14 +210,11 @@ fn edit_inner(
     }
     sets.push("updated_at = datetime('now')".to_string());
 
-    // The claimed/done guard is baked into this same atomic UPDATE rather
-    // than a separate check-then-act: a concurrent `claim` landing between a
-    // precondition check and the mutation would otherwise let an edit slip
-    // through silently. Reproduced directly against `remove`'s analogous
-    // DELETE (see remove_inner) before fixing both.
     params.push(Box::new(id));
     let sql = format!(
-        "UPDATE tasks SET {} WHERE id = ?{} AND executor IS NULL AND status != 'done'",
+        "UPDATE tasks SET {} WHERE id = ?{}
+         AND (executor IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= datetime('now'))
+         AND status NOT IN ('review', 'done')",
         sets.join(", "),
         params.len()
     );
@@ -233,22 +232,16 @@ fn edit_inner(
     crate::commands::fetch_task(conn, id)
 }
 
-/// After an atomically-guarded `UPDATE`/`DELETE` on `tasks` affects 0 rows,
-/// figure out why: missing, claimed, or done. `verb` is used in the
-/// "claimed" message ("editing"/"removing"); `done_msg` is the full,
-/// already-formatted "done" error text (the two callers phrase it
-/// differently). If the row's state changed yet again between the failed
-/// guarded statement and this diagnostic read (an extremely narrow window),
-/// report that plainly rather than guessing.
 fn diagnose_mutation_guard_failure(
     conn: &Connection,
     id: i64,
     verb: &str,
     done_msg: &str,
 ) -> anyhow::Error {
-    let row: rusqlite::Result<Option<(Option<i64>, String)>> = conn
+    let row: rusqlite::Result<Option<(bool, String)>> = conn
         .query_row(
-            "SELECT executor, status FROM tasks WHERE id = ?1",
+            "SELECT executor IS NOT NULL AND lease_expires_at > datetime('now'), status
+             FROM tasks WHERE id = ?1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -256,10 +249,13 @@ fn diagnose_mutation_guard_failure(
     match row {
         Err(e) => e.into(),
         Ok(None) => anyhow::anyhow!("task {id} not found"),
-        Ok(Some((executor, _))) if executor.is_some() => {
+        Ok(Some((true, _))) => {
             anyhow::anyhow!("task {id} is claimed; release it before {verb}")
         }
         Ok(Some((_, status))) if status == "done" => anyhow::anyhow!("{done_msg}"),
+        Ok(Some((_, status))) if status == "review" => {
+            anyhow::anyhow!("task {id} is in review; request changes before {verb}")
+        }
         Ok(Some(_)) => {
             anyhow::anyhow!(
                 "task {id} could not be modified (state changed concurrently; try again)"
@@ -268,24 +264,16 @@ fn diagnose_mutation_guard_failure(
     }
 }
 
-/// `agent-kanban remove <id>`
-/// Hard-delete the task row. Fails if `executor IS NOT NULL` (must `release`
-/// first) OR `status = 'done'` (finished tasks can't be deleted). See todo.md
-/// section 3.
 pub fn remove(id: i64) -> Result<Value> {
     let conn = crate::db::open_existing()?;
     remove_inner(&conn, id)
 }
 
 fn remove_inner(conn: &Connection, id: i64) -> Result<Value> {
-    // The claimed/done guard is baked into this same atomic DELETE rather
-    // than a separate check-then-act: a plain `SELECT` check followed by an
-    // unconditional `DELETE FROM tasks WHERE id = ?1` has a real race window
-    // — if a concurrent `claim` lands between the two statements, the
-    // DELETE still fires unconditionally and silently destroys an actively
-    // claimed task. Confirmed by direct reproduction before this fix.
     let changed = conn.execute(
-        "DELETE FROM tasks WHERE id = ?1 AND executor IS NULL AND status != 'done'",
+        "DELETE FROM tasks WHERE id = ?1
+         AND (executor IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= datetime('now'))
+         AND status NOT IN ('review', 'done')",
         [id],
     )?;
 
@@ -308,26 +296,8 @@ mod tests {
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE agents (
-               id INTEGER PRIMARY KEY,
-               name TEXT NOT NULL UNIQUE,
-               created_at TEXT NOT NULL DEFAULT (datetime('now'))
-             );
-             CREATE TABLE tasks (
-               id INTEGER PRIMARY KEY,
-               title TEXT NOT NULL,
-               priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
-               status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
-               executor INTEGER REFERENCES agents(id),
-               tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
-               tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
-               created_at TEXT NOT NULL DEFAULT (datetime('now')),
-               updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-             );",
-        )
-        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
         conn
     }
 
@@ -456,14 +426,24 @@ mod tests {
     #[test]
     fn list_filters_by_executor_name() {
         let conn = setup();
-        conn.execute("INSERT INTO agents (name) VALUES ('agent-a')", [])
-            .unwrap();
-        conn.execute("INSERT INTO agents (name) VALUES ('agent-b')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES ('agent-a', 'developer')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES ('agent-b', 'developer')",
+            [],
+        )
+        .unwrap();
         let t1 = add_inner(&conn, "t1", "low", &[], &[sample_test("d")]).unwrap();
         add_inner(&conn, "t2", "low", &[], &[sample_test("d")]).unwrap();
         conn.execute(
-            "UPDATE tasks SET executor = (SELECT id FROM agents WHERE name = 'agent-a') WHERE id = ?1",
+            "UPDATE tasks
+             SET executor = (SELECT id FROM agents WHERE name = 'agent-a'),
+                 claimed_at = datetime('now'),
+                 lease_expires_at = datetime('now', '+1 hour')
+             WHERE id = ?1",
             [t1["id"].as_i64().unwrap()],
         )
         .unwrap();
@@ -514,12 +494,19 @@ mod tests {
     #[test]
     fn edit_blocked_when_claimed() {
         let conn = setup();
-        conn.execute("INSERT INTO agents (name) VALUES ('agent-a')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES ('agent-a', 'developer')",
+            [],
+        )
+        .unwrap();
         let created = add_inner(&conn, "t1", "low", &[], &[sample_test("d")]).unwrap();
         let id = created["id"].as_i64().unwrap();
         conn.execute(
-            "UPDATE tasks SET executor = (SELECT id FROM agents WHERE name = 'agent-a') WHERE id = ?1",
+            "UPDATE tasks
+             SET executor = (SELECT id FROM agents WHERE name = 'agent-a'),
+                 claimed_at = datetime('now'),
+                 lease_expires_at = datetime('now', '+1 hour')
+             WHERE id = ?1",
             [id],
         )
         .unwrap();
@@ -631,12 +618,19 @@ mod tests {
     #[test]
     fn remove_blocked_when_claimed() {
         let conn = setup();
-        conn.execute("INSERT INTO agents (name) VALUES ('agent-a')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES ('agent-a', 'developer')",
+            [],
+        )
+        .unwrap();
         let created = add_inner(&conn, "t1", "low", &[], &[sample_test("d")]).unwrap();
         let id = created["id"].as_i64().unwrap();
         conn.execute(
-            "UPDATE tasks SET executor = (SELECT id FROM agents WHERE name = 'agent-a') WHERE id = ?1",
+            "UPDATE tasks
+             SET executor = (SELECT id FROM agents WHERE name = 'agent-a'),
+                 claimed_at = datetime('now'),
+                 lease_expires_at = datetime('now', '+1 hour')
+             WHERE id = ?1",
             [id],
         )
         .unwrap();
@@ -714,17 +708,28 @@ mod tests {
         // single statement rather than relying on a prior check — against
         // the OLD unconditional `DELETE FROM tasks WHERE id = ?1`, this test
         // would fail (both rows would be deleted).
-        const GUARDED_DELETE: &str =
-            "DELETE FROM tasks WHERE id = ?1 AND executor IS NULL AND status != 'done'";
+        const GUARDED_DELETE: &str = "DELETE FROM tasks WHERE id = ?1
+             AND (
+               executor IS NULL OR lease_expires_at IS NULL
+               OR lease_expires_at <= datetime('now')
+             )
+             AND status NOT IN ('review', 'done')";
 
         let conn = setup();
-        conn.execute("INSERT INTO agents (name) VALUES ('agent-a')", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES ('agent-a', 'developer')",
+            [],
+        )
+        .unwrap();
 
         let claimed = add_inner(&conn, "claimed", "low", &[], &[sample_test("d")]).unwrap();
         let claimed_id = claimed["id"].as_i64().unwrap();
         conn.execute(
-            "UPDATE tasks SET executor = (SELECT id FROM agents WHERE name = 'agent-a') WHERE id = ?1",
+            "UPDATE tasks
+             SET executor = (SELECT id FROM agents WHERE name = 'agent-a'),
+                 claimed_at = datetime('now'),
+                 lease_expires_at = datetime('now', '+1 hour')
+             WHERE id = ?1",
             [claimed_id],
         )
         .unwrap();

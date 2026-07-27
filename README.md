@@ -20,7 +20,7 @@ entirely.
 
 ## Install / Build
 
-Requires a Rust toolchain (stable, edition 2024).
+Requires Rust 1.95 or newer (stable, edition 2024).
 
 Install from [crates.io](https://crates.io/crates/agent-kanban) straight to `~/.cargo/bin`
 (already on `PATH` for most Rust setups):
@@ -59,105 +59,68 @@ directly:
 $ agent-kanban init
 {"status":"initialized"}
 
-$ agent-kanban agent register alice
-{"created_at":"2026-07-03 12:00:00","id":1,"name":"alice"}
+$ agent-kanban agent register alice --role developer
+{"created_at":"2026-07-03 12:00:00","id":1,"name":"alice","role":"developer"}
 
-$ agent-kanban add \
-    --title "Add input validation to /login" \
-    --priority high \
+$ agent-kanban agent register bob --role reviewer
+{"created_at":"2026-07-03 12:00:00","id":2,"name":"bob","role":"reviewer"}
+
+$ agent-kanban add --title "Validate /login input" --priority high \
     --tag backend \
-    --tag security \
     --test '{"describe":"rejects empty password","input":"{\"password\":\"\"}","output":"400 error"}'
-{
-  "created_at": "2026-07-03 12:00:00",
-  "executor": null,
-  "id": 1,
-  "priority": "high",
-  "status": "todo",
-  "tags": ["backend", "security"],
-  "tests": [
-    {
-      "describe": "rejects empty password",
-      "input": "{\"password\":\"\"}",
-      "output": "400 error"
-    }
-  ],
-  "title": "Add input validation to /login",
-  "updated_at": "2026-07-03 12:00:00"
-}
+{..., "id":1, "revision":0, "status":"todo", "executor":null, ...}
 
-$ agent-kanban claim 1 --agent alice
-{..., "executor": "alice", "id": 1, "status": "in_progress", ...}
-```
-
-Claiming sets `status` to `in_progress` in the same atomic step — no separate "start
-work" call needed.
-
-```sh
-# ... alice implements the change, runs the test above by hand, confirms it passes ...
-
-$ agent-kanban move 1 --status done
-{..., "executor": "alice", "id": 1, "status": "done", ...}
-```
-
-A second agent racing for the same task gets a clean failure instead of silently
-overwriting the first — claiming is atomic, so exactly one caller ever wins, even if
-both request it at the same instant:
-
-```sh
-$ agent-kanban agent register bob
-{"created_at":"2026-07-03 12:00:00","id":2,"name":"bob"}
-
-$ agent-kanban claim 1 --agent bob
-{"error": "task 1 is already claimed"}
-```
-
-Other lifecycle operations, shown on a second task:
-
-```sh
-$ agent-kanban add --title "Write onboarding docs" --priority low \
-    --test '{"describe":"docs exist","input":"n/a","output":"file present"}'
-{..., "id": 2, "status": "todo", ...}
-
-$ agent-kanban claim 2 --agent alice
+$ agent-kanban claim 1 --agent alice --lease-seconds 3600
 {..., "executor": "alice", "status": "in_progress", ...}
 
-# Un-claim a task instead of finishing it (resets status to todo, clears executor)
-$ agent-kanban release 2
-{..., "executor": null, "status": "todo", ...}
+# Alice implements and verifies the acceptance criterion.
+$ agent-kanban submit-review 1 --agent alice \
+    --result '{"criterion":0,"status":"passed","evidence":"cargo test login_empty_password"}'
+{..., "executor":null, "revision":1, "status":"review",
+ "acceptance_results":[{"criterion":0,"status":"passed","evidence":"cargo test login_empty_password",...}], ...}
 
-# Edit a task (only allowed while unclaimed and not done)
-$ agent-kanban edit 2 --priority medium
-{..., "priority": "medium", ...}
+$ agent-kanban claim-review 1 --agent bob --lease-seconds 1800
+{..., "executor":"bob", "executor_role":"reviewer", "status":"review", ...}
 
-# Delete a task (only allowed while unclaimed and not done)
-$ agent-kanban remove 2
-{"removed": 2}
+$ agent-kanban approve 1 --agent bob --notes "behavior and test evidence verified"
+{..., "executor":null, "status":"done",
+ "review_history":[{"decision":"approved","executor":"bob","revision":1,...}], ...}
 
-# Board overview: counts per status column, plus each agent's current workload
 $ agent-kanban status
-{"agents":{"alice":1,"bob":0},"backlog":0,"done":1,"in_progress":0,"review":0,"todo":0,"total":1}
+{"agents":{"alice":0,"bob":0},"backlog":0,"done":1,"in_progress":0,"review":0,"todo":0,"total":1}
 ```
+
+`submit-review` changes the status and releases the developer in one transaction.
+`claim-review` assigns a reviewer without changing `review`. `approve` records the
+decision and clears the reviewer while moving the task to `done`. A reviewer can use
+`request-changes --notes "..."` instead; that records the decision, returns the task
+to unowned `in_progress`, and the next developer submission creates a new revision.
 
 ## Command reference
 
 | Command | Flags | Behavior / restrictions |
 |---|---|---|
 | `agent-kanban init` | | Creates `.kanban/` (and `board.db`) in the current directory. |
-| `agent-kanban agent register <name>` | | Registers an agent name. Must be done before that name can claim work. |
-| `agent-kanban agent list` | | Lists all registered agents. |
-| `agent-kanban agent remove <name>` | | Deletes the agent. Any tasks it currently holds are auto-released (executor cleared, status reset to `todo`) first, in the same transaction — an agent is never left dangling as a claim-holder that no longer exists. |
+| `agent-kanban agent register <name>` | `--role developer\|reviewer` | Registers a named role. The default role is `developer` for v1 compatibility. |
+| `agent-kanban agent list` | | Lists registered agents and their roles. |
+| `agent-kanban agent remove <name>` | | Clears that agent's active ownership and deletes it in one transaction. Task statuses are preserved, including `done`; review and acceptance history keep the executor name snapshot. |
 | `agent-kanban add` | `--title T`, `--priority P`, `--tag t` (repeatable), `--test '<json>'` (repeatable, required, ≥1) | Creates a task. New tasks start at status `todo`. Each `--test` must be a JSON object with exactly `describe`, `input`, `output` string fields; at least one is mandatory (enforced by a DB `CHECK` constraint and by application-level validation). |
-| `agent-kanban list` | `--status S`, `--tag T`, `--executor A`, `--priority P`, `--sort priority\|created_at` | Lists tasks, filters combinable. `--executor` matches by agent *name*. `--sort priority` orders by real severity (`urgent` > `high` > `medium` > `low`), not alphabetically; `--sort created_at` orders chronologically; with no `--sort`, tasks come back in creation order. |
-| `agent-kanban show <id>` | | Prints a single task. |
-| `agent-kanban claim <id> --agent <name>` | `--agent <name>` | Atomically assigns the task to `<name>` via a compare-and-swap update, only if the task is currently unclaimed. Exactly one caller wins under concurrent contention; losers get a clean `{"error": ...}`. Fails if `<name>` isn't a registered agent, without touching the task. |
-| `agent-kanban move <id> --status S` | `--status S` | Changes a task's status. |
-| `agent-kanban release <id>` | | Un-claims a task: clears `executor` and resets `status` back to `todo`. |
-| `agent-kanban edit <id>` | `--title T`, `--priority P`, `--tag t` (repeatable), `--test '<json>'` (repeatable) | Updates a task's fields. Refuses to act on a task that is currently claimed (release it first) or whose status is `done`. A task can never be edited down to zero tests. |
-| `agent-kanban remove <id>` | | Deletes a task. Same restriction as `edit`: refuses on a claimed or `done` task. |
-| `agent-kanban status` | | Board overview: a task count for each status column (`backlog`, `todo`, `in_progress`, `review`, `done` — all five, even at zero) plus `total`, and an `agents` object with every registered agent's current claimed-task count (including agents holding nothing). |
+| `agent-kanban list` | `--status S`, `--tag T`, `--executor A`, `--priority P`, `--sort priority\|created_at` | Lists tasks with combinable filters. `--executor` only matches a non-expired active lease. |
+| `agent-kanban show <id>` | | Prints the task, current revision, active owner/lease, acceptance results, and review history. |
+| `agent-kanban claim <id>` | `--agent <developer>`, `--lease-seconds N` | Atomically claims `todo` or unowned/expired `in_progress` work for a developer and sets/keeps `in_progress`. Repeating it as the same owner renews the lease. |
+| `agent-kanban submit-review <id>` | `--agent <developer>`, `--result '<json>'` (once per criterion) | Requires the active developer lease. Stores a complete `passed`/`failed` result set with non-empty evidence, increments `revision`, moves to `review`, and releases the developer atomically. |
+| `agent-kanban claim-review <id>` | `--agent <reviewer>`, `--lease-seconds N` | Atomically claims an unowned or expired task in `review`; status remains `review`. |
+| `agent-kanban approve <id>` | `--agent <reviewer>`, `--notes T` | Requires the active reviewer lease and no failed result in the current revision. Records the decision, moves to `done`, and clears ownership atomically. |
+| `agent-kanban request-changes <id>` | `--agent <reviewer>`, `--notes T` | Records required changes, moves back to unowned `in_progress`, and clears reviewer ownership atomically. |
+| `agent-kanban release <id>` | `--agent <current-owner>` | Clears only that agent's active ownership without changing task status. |
+| `agent-kanban move <id>` | `--status backlog\|todo` | Administrative move for unowned tasks. Lifecycle statuses cannot be bypassed with generic `move`. |
+| `agent-kanban edit <id>` | `--title T`, `--priority P`, `--tag t` (repeatable), `--test '<json>'` (repeatable) | Updates an unowned task outside `review`/`done`. A task can never be edited down to zero tests. |
+| `agent-kanban remove <id>` | | Deletes an unowned task outside `review`/`done`. |
+| `agent-kanban status` | | Counts each status and active, non-expired claims per agent. A `done` task is never active. |
+| `agent-kanban transitions` | | Returns the exact lifecycle transition table enforced by mutation commands. |
 
 Global flags:
+
 - `--pretty` and `--table` are mutually exclusive output modes. `--pretty` prints
   indented JSON for humans; without it, output is compact JSON on a single line,
   intended for other programs/agents to parse. `--table` renders a human-readable
@@ -186,31 +149,30 @@ waits and retries instead of failing immediately — so many `agent-kanban` proc
 (potentially one per agent) can hit the same file at once without hand-rolled
 locking. The schema version is stamped via `PRAGMA user_version` on `init`; opening a
 project created by a newer, incompatible `agent-kanban` fails with a clear error instead of
-silently misinterpreting a schema it doesn't understand.
+silently misinterpreting a schema it doesn't understand. Opening a v1 board migrates
+it transactionally to v2. Existing agents become developers; active legacy claims
+on `in_progress` receive a one-hour lease. Legacy `review` tasks return to unowned
+`in_progress` because v1 has no recorded acceptance evidence to review; `done`
+keeps its status while any stale owner is cleared, so completed work never becomes
+active again.
 
-The part that actually matters for correctness is that every state-changing
-operation on a task is a single, self-contained SQL statement with its precondition
-baked into the same `WHERE` clause — not a read-then-write in application code, which
-would leave a window for another process to change the row in between:
+Status and ownership are independent columns. Every claim/release has its
+preconditions in the same guarded `UPDATE`, including role, allowed status, current
+owner, and lease expiry. Expired claims are inactive and can be replaced atomically.
+Multi-row operations (`submit-review`, `approve`, and `request-changes`) use an
+immediate SQLite transaction: acceptance results or review history and the task
+transition commit together or roll back together.
 
-- `agent-kanban claim` — `UPDATE tasks SET executor = ?, ... WHERE id = ? AND executor IS NULL`.
-  If two agent processes race to claim the same task, the database serializes the two
-  `UPDATE`s; the one that runs first flips `executor` from `NULL` to its name and
-  reports success, and the second one's `WHERE` clause no longer matches anything, so
-  it affects zero rows and `agent-kanban` reports a clean "already claimed" error.
-- `agent-kanban release` — the mirror image: `... WHERE id = ? AND executor IS NOT NULL`,
-  so a stale `release` can never clobber a task that was released and re-claimed by
-  someone else in the meantime.
-- `agent-kanban edit` / `agent-kanban remove` — both require `executor IS NULL AND status != 'done'`
-  in the same guarded statement, so a `claim` landing between a caller's mental model
-  and the actual edit/delete can't silently slip through.
+The lifecycle table returned by `agent-kanban transitions` is also the table used by
+the command implementation. Generic `move` only exposes `backlog ↔ todo`, so it
+cannot jump directly to `review` or `done`.
 
 Each of these has been verified under real multi-process contention (hundreds of
 concurrent attempts across test runs, spawning actual separate OS processes against
-the same database file, not just threads), always with exactly one well-defined
-winner and never a corrupted or split-brain outcome.
+the same database file, not just threads), including races between developers and
+between reviewers.
 
-## Tests are specs, not executables
+## Acceptance specs and results
 
 The `tests` attached to a task are **acceptance-criteria specifications**, not code
 `agent-kanban` runs. Each one is a JSON object with three string fields:
@@ -219,16 +181,22 @@ The `tests` attached to a task are **acceptance-criteria specifications**, not c
 - `input` — the input/scenario
 - `output` — the expected result
 
-`agent-kanban` stores and validates the *shape* of these specs; it never executes them.
-Confirming a task's tests actually pass is the responsibility of the agent doing the
-work, before it moves the task to `done`.
+`agent-kanban` stores and validates the shape of these specs; it never executes them.
+The developer must supply one result for every criterion when submitting a revision:
+
+```json
+{"criterion":0,"status":"passed","evidence":"cargo test login_empty_password"}
+```
+
+`status` is exactly `passed` or `failed`, and `evidence` must be non-empty. Results
+store the criterion snapshot, revision, developer name, and verification time.
+Approval is blocked while the current revision contains a failed result.
 
 Every task must have at least one test, and this is non-negotiable: it's enforced by
 a database `CHECK` constraint (a non-empty JSON array) and re-validated in
 application code on every `add` and `edit`. A task can never be edited down to zero
-tests. This exists because TDD matters — a task isn't really "done" unless it had a
-concrete, checkable definition of done attached from the moment it was created, not
-invented retroactively after the code was written.
+tests. Review decisions likewise keep the revision, decision, notes, reviewer-name
+snapshot, and timestamp even if that agent is later removed.
 
 ## License
 

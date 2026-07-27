@@ -91,9 +91,7 @@ fn claim_race_exactly_one_winner() {
             winners.len(),
             1,
             "round {round}: expected exactly one winner, got {} winners ({winners:?}); \
-             this indicates a real concurrency bug in claim() -- either the atomic \
-             UPDATE...WHERE executor IS NULL guard is not actually exclusive, or two \
-             processes both observed executor IS NULL before either committed",
+             this indicates that the atomic ownership guard admitted two developers",
             winners.len()
         );
 
@@ -120,5 +118,83 @@ fn claim_race_exactly_one_winner() {
             "round {round}: show's executor does not match the process that won the race"
         );
         assert_eq!(shown["status"], "in_progress");
+    }
+}
+
+#[test]
+fn review_claim_race_exactly_one_reviewer_wins() {
+    let dir = TempDir::new().unwrap();
+    run_json(&dir, &["init"]);
+    run_json(
+        &dir,
+        &["agent", "register", "developer", "--role", "developer"],
+    );
+    let reviewer_names: Vec<String> = (0..NUM_AGENTS).map(|i| format!("reviewer-{i}")).collect();
+    for name in &reviewer_names {
+        run_json(&dir, &["agent", "register", name, "--role", "reviewer"]);
+    }
+
+    for round in 0..NUM_ROUNDS {
+        let created = run_json(
+            &dir,
+            &[
+                "add",
+                "--title",
+                &format!("review race task round {round}"),
+                "--priority",
+                "medium",
+                "--test",
+                r#"{"describe":"d","input":"i","output":"o"}"#,
+            ],
+        );
+        let task_id = created["id"].as_i64().unwrap().to_string();
+        run_json(&dir, &["claim", &task_id, "--agent", "developer"]);
+        run_json(
+            &dir,
+            &[
+                "submit-review",
+                &task_id,
+                "--agent",
+                "developer",
+                "--result",
+                r#"{"criterion":0,"status":"passed","evidence":"verified"}"#,
+            ],
+        );
+
+        let mut children: Vec<(String, Child)> = Vec::with_capacity(NUM_AGENTS);
+        for name in &reviewer_names {
+            let child = Command::new(kanban_bin())
+                .args(["claim-review", &task_id, "--agent", name])
+                .current_dir(&dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn claim-review subprocess");
+            children.push((name.clone(), child));
+        }
+
+        let mut winners = Vec::new();
+        for (name, child) in children {
+            let output = child.wait_with_output().unwrap();
+            if output.status.success() {
+                winners.push(name);
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("already claimed"),
+                    "round {round}: unexpected claim-review failure for {name}: {stderr}"
+                );
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: expected exactly one review owner, got {winners:?}"
+        );
+        let shown = run_json(&dir, &["show", &task_id]);
+        assert_eq!(shown["status"], "review");
+        assert_eq!(shown["executor"], winners[0]);
+        assert_eq!(shown["executor_role"], "reviewer");
     }
 }

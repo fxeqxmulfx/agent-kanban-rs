@@ -31,6 +31,8 @@ fn status_inner(conn: &Connection) -> Result<Value> {
     let mut stmt = conn.prepare(
         "SELECT agents.name, COUNT(tasks.id) FROM agents \
          LEFT JOIN tasks ON tasks.executor = agents.id \
+          AND tasks.status != 'done' \
+          AND tasks.lease_expires_at > datetime('now') \
          GROUP BY agents.id ORDER BY agents.name",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -52,43 +54,31 @@ fn status_inner(conn: &Connection) -> Result<Value> {
 mod tests {
     use super::*;
 
-    const SCHEMA: &str = r"
-CREATE TABLE agents (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE tasks (
-  id INTEGER PRIMARY KEY,
-  title TEXT NOT NULL,
-  priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
-  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
-  executor INTEGER REFERENCES agents(id),
-  tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
-  tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-";
-
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
         conn
     }
 
     fn insert_agent(conn: &Connection, name: &str) -> i64 {
-        conn.execute("INSERT INTO agents (name) VALUES (?1)", [name])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO agents (name, role) VALUES (?1, 'developer')",
+            [name],
+        )
+        .unwrap();
         conn.last_insert_rowid()
     }
 
     fn insert_task(conn: &Connection, status: &str, executor: Option<i64>) {
         conn.execute(
-            "INSERT INTO tasks (title, priority, status, executor, tests) \
-             VALUES ('t', 'low', ?1, ?2, '[\"x\"]')",
+            "INSERT INTO tasks (
+               title, priority, status, executor, tests, claimed_at, lease_expires_at
+             ) VALUES (
+               't', 'low', ?1, ?2, '[\"x\"]',
+               CASE WHEN ?2 IS NULL THEN NULL ELSE datetime('now') END,
+               CASE WHEN ?2 IS NULL THEN NULL ELSE datetime('now', '+1 hour') END
+             )",
             rusqlite::params![status, executor],
         )
         .unwrap();
@@ -136,16 +126,13 @@ CREATE TABLE tasks (
     }
 
     #[test]
-    fn done_tasks_still_count_toward_the_agent_that_finished_them() {
-        // executor isn't cleared on completion (only release/agent-remove
-        // clear it), so a done task still counts against its agent here --
-        // this reports current DB state, not "currently active work".
+    fn done_tasks_do_not_count_as_active_claims() {
         let conn = setup();
-        let alice = insert_agent(&conn, "alice");
-        insert_task(&conn, "done", Some(alice));
+        insert_agent(&conn, "alice");
+        insert_task(&conn, "done", None);
 
         let result = status_inner(&conn).unwrap();
-        assert_eq!(result["agents"]["alice"], 1);
+        assert_eq!(result["agents"]["alice"], 0);
         assert_eq!(result["done"], 1);
     }
 }

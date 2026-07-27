@@ -86,31 +86,85 @@ enum Command {
         id: i64,
     },
 
-    /// Claim a task for a registered agent (atomic; fails if already claimed).
+    /// Claim development work for a developer.
     Claim {
         /// Task id.
         id: i64,
-        /// Registered agent name to claim it for.
+        /// Registered developer name.
         #[arg(long)]
         agent: String,
+        /// Claim lease duration in seconds.
+        #[arg(long, default_value_t = commands::lifecycle::DEFAULT_LEASE_SECONDS)]
+        lease_seconds: u32,
     },
 
-    /// Move a task to a new status.
+    /// Submit completed development work for review.
+    SubmitReview {
+        /// Task id.
+        id: i64,
+        /// Developer currently holding the task.
+        #[arg(long)]
+        agent: String,
+        /// Acceptance result JSON: {"criterion":0,"status":"passed|failed","evidence":"..."}.
+        #[arg(long = "result", required = true)]
+        results: Vec<String>,
+    },
+
+    /// Claim a task in review for a reviewer.
+    ClaimReview {
+        /// Task id.
+        id: i64,
+        /// Registered reviewer name.
+        #[arg(long)]
+        agent: String,
+        /// Claim lease duration in seconds.
+        #[arg(long, default_value_t = commands::lifecycle::DEFAULT_LEASE_SECONDS)]
+        lease_seconds: u32,
+    },
+
+    /// Approve the current review revision and finish the task.
+    Approve {
+        /// Task id.
+        id: i64,
+        /// Reviewer currently holding the task.
+        #[arg(long)]
+        agent: String,
+        /// Review notes.
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+
+    /// Return the current review revision to development.
+    RequestChanges {
+        /// Task id.
+        id: i64,
+        /// Reviewer currently holding the task.
+        #[arg(long)]
+        agent: String,
+        /// Required review findings or requested changes.
+        #[arg(long)]
+        notes: String,
+    },
+
+    /// Move an unclaimed task between backlog and todo.
     Move {
         /// Task id.
         id: i64,
-        /// New status: backlog, todo, `in_progress`, review, or done.
+        /// New status: backlog or todo.
         #[arg(long)]
         status: String,
     },
 
-    /// Un-claim a task.
+    /// Release a task without changing its status.
     Release {
         /// Task id.
         id: i64,
+        /// Agent currently holding the task.
+        #[arg(long)]
+        agent: String,
     },
 
-    /// Edit a task's fields in place. Blocked while claimed or done.
+    /// Edit an unowned task outside review and done.
     Edit {
         /// Task id.
         id: i64,
@@ -129,7 +183,7 @@ enum Command {
         tests: Option<Vec<String>>,
     },
 
-    /// Hard-delete a task. Blocked while claimed or done.
+    /// Hard-delete an unowned task outside review and done.
     Remove {
         /// Task id.
         id: i64,
@@ -138,14 +192,20 @@ enum Command {
     /// Board overview: task counts per status column plus each registered
     /// agent's current claimed-task count.
     Status,
+
+    /// Show the lifecycle transition table enforced by mutation commands.
+    Transitions,
 }
 
 #[derive(Subcommand)]
 enum AgentAction {
-    /// Register a new agent name.
+    /// Register a new agent name and role.
     Register {
         /// Agent name to register.
         name: String,
+        /// Agent role: developer or reviewer.
+        #[arg(long, default_value = "developer")]
+        role: String,
     },
     /// List registered agents.
     List,
@@ -187,7 +247,7 @@ fn main() {
     let result = match cli.command {
         Command::Init => commands::init(),
         Command::Agent { action } => match action {
-            AgentAction::Register { name } => commands::agent::register(&name),
+            AgentAction::Register { name, role } => commands::agent::register(&name, &role),
             AgentAction::List => commands::agent::list(),
             AgentAction::Remove { name } => commands::agent::remove(&name),
         },
@@ -205,9 +265,25 @@ fn main() {
             sort,
         } => commands::task::list(status, tag, executor, priority, sort.as_deref()),
         Command::Show { id } => commands::task::show(id),
-        Command::Claim { id, agent } => commands::lifecycle::claim(id, &agent),
+        Command::Claim {
+            id,
+            agent,
+            lease_seconds,
+        } => commands::lifecycle::claim(id, &agent, lease_seconds),
+        Command::SubmitReview { id, agent, results } => {
+            commands::lifecycle::submit_review(id, &agent, &results)
+        }
+        Command::ClaimReview {
+            id,
+            agent,
+            lease_seconds,
+        } => commands::lifecycle::claim_review(id, &agent, lease_seconds),
+        Command::Approve { id, agent, notes } => commands::lifecycle::approve(id, &agent, &notes),
+        Command::RequestChanges { id, agent, notes } => {
+            commands::lifecycle::request_changes(id, &agent, &notes)
+        }
         Command::Move { id, status } => commands::lifecycle::move_status(id, &status),
-        Command::Release { id } => commands::lifecycle::release(id),
+        Command::Release { id, agent } => commands::lifecycle::release(id, &agent),
         Command::Edit {
             id,
             title,
@@ -217,6 +293,7 @@ fn main() {
         } => commands::task::edit(id, title, priority, tags, tests.as_deref()),
         Command::Remove { id } => commands::task::remove(id),
         Command::Status => commands::status::status(),
+        Command::Transitions => Ok(commands::lifecycle::transitions()),
     };
 
     let format = if cli.table {

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -19,16 +19,13 @@ pub fn set_path_override(path: PathBuf) {
     let _ = PATH_OVERRIDE.set(path);
 }
 
-/// Tracked via `PRAGMA user_version`, `SQLite`'s built-in per-database integer
-/// slot meant for exactly this — no bespoke schema-version table needed.
-/// Bump this and add a migration step in `try_init`/`open_existing` when the
-/// schema ever actually changes; there's only ever been one shape so far.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
-const SCHEMA: &str = r"
+pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS agents (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'developer' CHECK (role IN ('developer','reviewer')),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -40,9 +37,49 @@ CREATE TABLE IF NOT EXISTS tasks (
   executor INTEGER REFERENCES agents(id),
   tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
   tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
+  revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+  claimed_at TEXT,
+  lease_expires_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK (
+    (executor IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL)
+    OR
+    (executor IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+  ),
+  CHECK (status != 'done' OR executor IS NULL)
 );
+
+CREATE TABLE IF NOT EXISTS review_history (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  decision TEXT NOT NULL CHECK (decision IN ('approved','changes_requested')),
+  notes TEXT NOT NULL DEFAULT '',
+  executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+  executor_name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (task_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS acceptance_results (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  criterion_index INTEGER NOT NULL CHECK (criterion_index >= 0),
+  criterion TEXT NOT NULL CHECK (json_valid(criterion)),
+  result TEXT NOT NULL CHECK (result IN ('passed','failed')),
+  evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+  executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+  executor_name TEXT NOT NULL,
+  verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (task_id, revision, criterion_index)
+);
+
+CREATE INDEX IF NOT EXISTS review_history_task_revision
+  ON review_history(task_id, revision);
+CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
+  ON acceptance_results(task_id, revision, criterion_index);
 ";
 
 /// Walk up from cwd looking for `.kanban/board.db`, like git looks for `.git`.
@@ -96,18 +133,11 @@ pub fn open_existing() -> Result<Connection> {
             anyhow::anyhow!("not a kanban project (no .kanban/ found); run `agent-kanban init`")
         })?,
     };
-    let conn = open_at(&path)?;
-    check_schema_version(&conn)?;
+    let mut conn = open_at(&path)?;
+    migrate_schema(&mut conn)?;
     Ok(conn)
 }
 
-/// A database with `user_version` unset (0) predates this check or was
-/// created by a version of `agent-kanban` from before schema versioning
-/// existed — harmless, since the schema shape has never actually changed, so
-/// there's nothing to migrate. Only bail if the version is *higher* than
-/// this binary understands: that means the project was set up by a newer,
-/// incompatible `agent-kanban`, and silently proceeding could misinterpret a
-/// schema this binary doesn't know about.
 fn check_schema_version(conn: &Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -176,13 +206,134 @@ pub fn init() -> Result<()> {
 }
 
 fn try_init(path: &Path) -> Result<()> {
-    let conn = open_at(path)?;
+    let mut conn = open_at(path)?;
+    check_schema_version(&conn)?;
     conn.execute_batch(SCHEMA)?;
-    // PRAGMA statements don't support `?` bind parameters in SQLite; this is
-    // safe to format directly since SCHEMA_VERSION is a fixed constant, not
-    // user input.
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    migrate_schema(&mut conn)?;
     Ok(())
+}
+
+fn migrate_schema(conn: &mut Connection) -> Result<()> {
+    check_schema_version(conn)?;
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        bail!(
+            "this project's schema version ({version}) is newer than this build of \
+             agent-kanban supports ({SCHEMA_VERSION}); upgrade agent-kanban"
+        );
+    }
+    if !table_exists(&tx, "agents")? || !table_exists(&tx, "tasks")? {
+        bail!("database is not initialized; run `agent-kanban init`");
+    }
+    if version == SCHEMA_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    if table_exists(&tx, "agents")? && !column_exists(&tx, "agents", "role")? {
+        tx.execute_batch(
+            "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'
+             CHECK (role IN ('developer','reviewer'));",
+        )?;
+    }
+
+    if table_exists(&tx, "tasks")? {
+        if !column_exists(&tx, "tasks", "revision")? {
+            tx.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
+                 CHECK (revision >= 0);",
+            )?;
+        }
+        if !column_exists(&tx, "tasks", "claimed_at")? {
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN claimed_at TEXT;")?;
+        }
+        if !column_exists(&tx, "tasks", "lease_expires_at")? {
+            tx.execute_batch("ALTER TABLE tasks ADD COLUMN lease_expires_at TEXT;")?;
+        }
+
+        tx.execute(
+            "UPDATE tasks
+             SET status = CASE WHEN status = 'review' THEN 'in_progress' ELSE status END,
+                 executor = NULL,
+                 claimed_at = NULL,
+                 lease_expires_at = NULL
+             WHERE status = 'review'
+                OR (status != 'in_progress' AND executor IS NOT NULL)",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE tasks
+             SET claimed_at = COALESCE(claimed_at, datetime('now')),
+                 lease_expires_at = COALESCE(
+                   lease_expires_at,
+                   datetime('now', '+3600 seconds')
+                 )
+             WHERE executor IS NOT NULL AND status = 'in_progress'",
+            [],
+        )?;
+    }
+
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS review_history (
+           id INTEGER PRIMARY KEY,
+           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+           revision INTEGER NOT NULL CHECK (revision > 0),
+           decision TEXT NOT NULL CHECK (decision IN ('approved','changes_requested')),
+           notes TEXT NOT NULL DEFAULT '',
+           executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+           executor_name TEXT NOT NULL,
+           created_at TEXT NOT NULL DEFAULT (datetime('now')),
+           UNIQUE (task_id, revision)
+         );
+         CREATE TABLE IF NOT EXISTS acceptance_results (
+           id INTEGER PRIMARY KEY,
+           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+           revision INTEGER NOT NULL CHECK (revision > 0),
+           criterion_index INTEGER NOT NULL CHECK (criterion_index >= 0),
+           criterion TEXT NOT NULL CHECK (json_valid(criterion)),
+           result TEXT NOT NULL CHECK (result IN ('passed','failed')),
+           evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+           executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+           executor_name TEXT NOT NULL,
+           verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+           UNIQUE (task_id, revision, criterion_index)
+         );
+         CREATE INDEX IF NOT EXISTS review_history_task_revision
+           ON review_history(task_id, revision);
+         CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
+           ON acceptance_results(task_id, revision, criterion_index);",
+    )?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in columns {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -212,5 +363,91 @@ mod tests {
             .unwrap();
         let err = check_schema_version(&conn).unwrap_err();
         assert!(err.to_string().contains("newer than this build"));
+    }
+
+    #[test]
+    fn version_one_migration_adds_roles_leases_and_review_storage() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE agents (
+               id INTEGER PRIMARY KEY,
+               name TEXT NOT NULL UNIQUE,
+               created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE tasks (
+               id INTEGER PRIMARY KEY,
+               title TEXT NOT NULL,
+               priority TEXT NOT NULL,
+               status TEXT NOT NULL,
+               executor INTEGER REFERENCES agents(id),
+               tags TEXT NOT NULL DEFAULT '[]',
+               tests TEXT NOT NULL,
+               created_at TEXT NOT NULL DEFAULT (datetime('now')),
+               updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO agents (id, name) VALUES (1, 'legacy-agent');
+             INSERT INTO tasks (id, title, priority, status, executor, tests)
+               VALUES (1, 'active', 'high', 'in_progress', 1, '[\"criterion\"]');
+             INSERT INTO tasks (id, title, priority, status, executor, tests)
+               VALUES (2, 'finished', 'low', 'done', 1, '[\"criterion\"]');
+             INSERT INTO tasks (id, title, priority, status, executor, tests)
+               VALUES (3, 'awaiting review', 'medium', 'review', 1, '[\"criterion\"]');
+             INSERT INTO tasks (id, title, priority, status, executor, tests)
+               VALUES (4, 'unowned review', 'medium', 'review', NULL, '[\"criterion\"]');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        migrate_schema(&mut conn).unwrap();
+        migrate_schema(&mut conn).unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let role: String = conn
+            .query_row("SELECT role FROM agents WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(role, "developer");
+
+        let (status, executor, active): (String, Option<i64>, bool) = conn
+            .query_row(
+                "SELECT status, executor, lease_expires_at > datetime('now')
+                 FROM tasks WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "in_progress");
+        assert_eq!(executor, Some(1));
+        assert!(active);
+
+        let (status, executor): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, executor FROM tasks WHERE id = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(executor, None);
+        let (status, executor): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT status, executor FROM tasks WHERE id = 3",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "in_progress");
+        assert_eq!(executor, None);
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = 4", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "in_progress");
+        assert!(table_exists(&conn, "review_history").unwrap());
+        assert!(table_exists(&conn, "acceptance_results").unwrap());
     }
 }

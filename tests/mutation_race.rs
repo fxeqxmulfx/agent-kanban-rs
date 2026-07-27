@@ -134,15 +134,12 @@ fn remove_vs_claim_race_never_corrupts_state() {
 }
 
 /// Race `release <id>` against `claim <id> --agent B` on a task already
-/// claimed by agent A. `release`'s guard (`executor IS NOT NULL`) is
-/// satisfied regardless of *who* holds the task, so it always succeeds here
-/// -- the only question is timing relative to claim:
+/// claimed by agent A. The release names agent A and therefore always
+/// succeeds here; the only question is timing relative to claim:
 ///   (a) release commits first: executor -> NULL, then claim sees NULL and
 ///       succeeds too (agent B now holds it, status `in_progress`).
 ///   (b) claim's statement runs while A still holds it: claim fails
-///       "already claimed" (A's hold is unaffected by the concurrent
-///       release, since release doesn't care who it releases); release
-///       still succeeds independently, clearing executor -> NULL.
+///       "already claimed"; release still succeeds, clearing executor.
 /// Both are valid, well-defined outcomes; anything else is corruption.
 #[test]
 fn release_vs_claim_race_never_corrupts_state() {
@@ -169,7 +166,7 @@ fn release_vs_claim_race_never_corrupts_state() {
         run_json(&dir, &["claim", &id_str, "--agent", "agent-a"]);
 
         let release_child = Command::new(kanban_bin())
-            .args(["release", &id_str])
+            .args(["release", &id_str, "--agent", "agent-a"])
             .current_dir(&dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -198,7 +195,6 @@ fn release_vs_claim_race_never_corrupts_state() {
         if claim_out.status.success() {
             // Outcome (a): release cleared it, claim then took it.
             assert_eq!(shown["executor"], "agent-b");
-            assert_eq!(shown["status"], "in_progress");
         } else {
             // Outcome (b): claim ran while agent-a still held it.
             let claim_stderr = String::from_utf8_lossy(&claim_out.stderr);
@@ -208,8 +204,8 @@ fn release_vs_claim_race_never_corrupts_state() {
             );
             // release still went on to clear it independently.
             assert_eq!(shown["executor"], Value::Null);
-            assert_eq!(shown["status"], "todo");
         }
+        assert_eq!(shown["status"], "in_progress");
     }
 }
 

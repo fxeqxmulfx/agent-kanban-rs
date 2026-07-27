@@ -2,32 +2,34 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde_json::{Value, json};
 
-/// `agent-kanban agent register <name>`
-/// Insert a new agent row. Must catch the UNIQUE constraint violation on a
-/// duplicate name and return it as a clean anyhow error (not a raw rusqlite
-/// error), per todo.md section 3/6.
-pub fn register(name: &str) -> Result<Value> {
+pub fn register(name: &str, role: &str) -> Result<Value> {
     let conn = crate::db::open_existing()?;
-    register_inner(&conn, name)
+    register_inner(&conn, name, role)
 }
 
-fn register_inner(conn: &Connection, name: &str) -> Result<Value> {
+fn register_inner(conn: &Connection, name: &str, role: &str) -> Result<Value> {
     let name = name.trim();
     if name.is_empty() {
         bail!("agent name must not be empty or whitespace-only");
     }
+    if !matches!(role, "developer" | "reviewer") {
+        bail!("invalid role '{role}': must be developer or reviewer");
+    }
 
-    let result = conn.execute("INSERT INTO agents (name) VALUES (?1)", [name]);
+    let result = conn.execute(
+        "INSERT INTO agents (name, role) VALUES (?1, ?2)",
+        rusqlite::params![name, role],
+    );
 
     match result {
         Ok(_) => {
             let id = conn.last_insert_rowid();
-            let (id, name, created_at): (i64, String, String) = conn.query_row(
-                "SELECT id, name, created_at FROM agents WHERE id = ?1",
+            let (id, name, role, created_at): (i64, String, String, String) = conn.query_row(
+                "SELECT id, name, role, created_at FROM agents WHERE id = ?1",
                 [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-            Ok(json!({"id": id, "name": name, "created_at": created_at}))
+            Ok(json!({"id": id, "name": name, "role": role, "created_at": created_at}))
         }
         Err(rusqlite::Error::SqliteFailure(ffi_err, _))
             if ffi_err.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -45,23 +47,19 @@ pub fn list() -> Result<Value> {
 }
 
 fn list_inner(conn: &Connection) -> Result<Value> {
-    let mut stmt = conn.prepare("SELECT id, name, created_at FROM agents ORDER BY name")?;
+    let mut stmt = conn.prepare("SELECT id, name, role, created_at FROM agents ORDER BY name")?;
     let rows = stmt.query_map([], |row| {
         let id: i64 = row.get(0)?;
         let name: String = row.get(1)?;
-        let created_at: String = row.get(2)?;
-        Ok(json!({"id": id, "name": name, "created_at": created_at}))
+        let role: String = row.get(2)?;
+        let created_at: String = row.get(3)?;
+        Ok(json!({"id": id, "name": name, "role": role, "created_at": created_at}))
     })?;
 
     let agents: std::result::Result<Vec<Value>, rusqlite::Error> = rows.collect();
     Ok(Value::Array(agents?))
 }
 
-/// `agent-kanban agent remove <name>`
-/// Auto-release then remove: in ONE transaction, release every task currently
-/// claimed by this agent (executor = NULL, status reset back to 'todo',
-/// `updated_at` bumped — same effect as `lifecycle::release` on each), then
-/// delete the agent row. See todo.md section 3/4/6.
 pub fn remove(name: &str) -> Result<Value> {
     let mut conn = crate::db::open_existing()?;
     // Must be `Immediate`, not the default `Deferred`: a deferred transaction
@@ -93,7 +91,11 @@ fn remove_inner(tx: &Transaction, name: &str) -> Result<Value> {
 
     let released_tasks: Vec<i64> = {
         let mut stmt = tx.prepare(
-            "UPDATE tasks SET executor = NULL, status = 'todo', updated_at = datetime('now') \
+            "UPDATE tasks
+             SET executor = NULL,
+                 claimed_at = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = datetime('now')
              WHERE executor = ?1 RETURNING id",
         )?;
         let rows = stmt.query_map([id], |row| row.get::<_, i64>(0))?;
@@ -124,30 +126,10 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    const SCHEMA: &str = r"
-CREATE TABLE agents (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE tasks (
-  id INTEGER PRIMARY KEY,
-  title TEXT NOT NULL,
-  priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
-  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
-  executor INTEGER REFERENCES agents(id),
-  tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
-  tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-";
-
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
         conn
     }
 
@@ -159,7 +141,7 @@ CREATE TABLE tasks (
         let path = dir.path().join("board.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
         (dir, conn)
     }
 
@@ -178,7 +160,7 @@ CREATE TABLE tasks (
         std::fs::set_permissions(&db_path, perms).unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
-        let err = register_inner(&conn, "agent-1").unwrap_err();
+        let err = register_inner(&conn, "agent-1", "developer").unwrap_err();
         assert!(
             !err.to_string().contains("already exists"),
             "unexpected message: {err}"
@@ -198,8 +180,9 @@ CREATE TABLE tasks (
     #[test]
     fn register_succeeds_and_returns_expected_json() {
         let conn = setup();
-        let result = register_inner(&conn, "agent-1").unwrap();
+        let result = register_inner(&conn, "agent-1", "developer").unwrap();
         assert_eq!(result["name"], "agent-1");
+        assert_eq!(result["role"], "developer");
         assert!(result["id"].is_i64());
         assert!(result["created_at"].is_string());
     }
@@ -207,40 +190,54 @@ CREATE TABLE tasks (
     #[test]
     fn register_rejects_empty_name() {
         let conn = setup();
-        let err = register_inner(&conn, "   ").unwrap_err();
+        let err = register_inner(&conn, "   ", "developer").unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn register_rejects_unknown_role() {
+        let conn = setup();
+        let err = register_inner(&conn, "agent-1", "writer").unwrap_err();
+        assert!(err.to_string().contains("developer or reviewer"));
     }
 
     #[test]
     fn register_duplicate_returns_clean_error() {
         let conn = setup();
-        register_inner(&conn, "agent-1").unwrap();
-        let err = register_inner(&conn, "agent-1").unwrap_err();
+        register_inner(&conn, "agent-1", "developer").unwrap();
+        let err = register_inner(&conn, "agent-1", "reviewer").unwrap_err();
         assert_eq!(err.to_string(), "agent 'agent-1' already exists");
     }
 
     #[test]
     fn list_returns_registered_agents() {
         let conn = setup();
-        register_inner(&conn, "bravo").unwrap();
-        register_inner(&conn, "alpha").unwrap();
+        register_inner(&conn, "bravo", "reviewer").unwrap();
+        register_inner(&conn, "alpha", "developer").unwrap();
         let result = list_inner(&conn).unwrap();
         let arr = result.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         // ordered by name
         assert_eq!(arr[0]["name"], "alpha");
+        assert_eq!(arr[0]["role"], "developer");
         assert_eq!(arr[1]["name"], "bravo");
+        assert_eq!(arr[1]["role"], "reviewer");
     }
 
     #[test]
     fn remove_cascades_and_releases_tasks() {
         let mut conn = setup();
-        let agent = register_inner(&conn, "agent-1").unwrap();
+        let agent = register_inner(&conn, "agent-1", "developer").unwrap();
         let agent_id = agent["id"].as_i64().unwrap();
 
         conn.execute(
-            "INSERT INTO tasks (id, title, priority, status, executor, tests, updated_at) \
-             VALUES (1, 'do thing', 'medium', 'in_progress', ?1, '[\"test\"]', '2000-01-01 00:00:00')",
+            "INSERT INTO tasks (
+               id, title, priority, status, executor, tests, claimed_at,
+               lease_expires_at, updated_at
+             ) VALUES (
+               1, 'do thing', 'medium', 'in_progress', ?1, '[\"test\"]',
+               datetime('now'), datetime('now', '+1 hour'), '2000-01-01 00:00:00'
+             )",
             [agent_id],
         )
         .unwrap();
@@ -261,7 +258,7 @@ CREATE TABLE tasks (
             )
             .unwrap();
         assert_eq!(executor, None);
-        assert_eq!(status, "todo");
+        assert_eq!(status, "in_progress");
         assert_ne!(updated_at, "2000-01-01 00:00:00");
 
         let agent_count: i64 = conn
@@ -290,11 +287,15 @@ CREATE TABLE tasks (
              BEGIN DELETE FROM agents WHERE id = OLD.executor; END;",
         )
         .unwrap();
-        let agent = register_inner(&conn, "agent-1").unwrap();
+        let agent = register_inner(&conn, "agent-1", "developer").unwrap();
         let agent_id = agent["id"].as_i64().unwrap();
         conn.execute(
-            "INSERT INTO tasks (id, title, priority, status, executor, tests) \
-             VALUES (1, 'do thing', 'medium', 'in_progress', ?1, '[\"test\"]')",
+            "INSERT INTO tasks (
+               id, title, priority, status, executor, tests, claimed_at, lease_expires_at
+             ) VALUES (
+               1, 'do thing', 'medium', 'in_progress', ?1, '[\"test\"]',
+               datetime('now'), datetime('now', '+1 hour')
+             )",
             [agent_id],
         )
         .unwrap();
@@ -315,7 +316,7 @@ CREATE TABLE tasks (
     #[test]
     fn register_trims_whitespace() {
         let conn = setup();
-        let result = register_inner(&conn, "  alice  ").unwrap();
+        let result = register_inner(&conn, "  alice  ", "developer").unwrap();
         assert_eq!(result["name"], "alice");
 
         let list = list_inner(&conn).unwrap();

@@ -68,10 +68,20 @@ fn init(dir: &TempDir) {
 }
 
 fn register(dir: &TempDir, name: &str) {
+    register_role(dir, name, "developer");
+}
+
+fn register_role(dir: &TempDir, name: &str, role: &str) {
     kanban(dir)
-        .args(["agent", "register", name])
+        .args(["agent", "register", name, "--role", role])
         .assert()
         .success();
+}
+
+fn remove_agent_with_no_claims(dir: &TempDir, name: &str) {
+    let removed = run_json(dir, &["agent", "remove", name]);
+    assert_eq!(removed["removed"], name);
+    assert_eq!(removed["released_tasks"].as_array().unwrap().len(), 0);
 }
 
 #[test]
@@ -85,8 +95,8 @@ fn golden_path_full_lifecycle() {
         .success()
         .stdout(contains("initialized"));
 
-    // agent register
     register(&dir, "agent-alpha");
+    register_role(&dir, "reviewer-beta", "reviewer");
 
     // add (with tags + a test)
     let test_json = r#"{"describe":"basic add","input":"2+2","output":"4"}"#;
@@ -135,43 +145,255 @@ fn golden_path_full_lifecycle() {
     assert_eq!(claimed["executor"], "agent-alpha");
     assert_eq!(claimed["status"], "in_progress");
 
-    // move to review
-    let moved = run_json(&dir, &["move", &task_id.to_string(), "--status", "review"]);
-    assert_eq!(moved["status"], "review");
+    let submitted = run_json(
+        &dir,
+        &[
+            "submit-review",
+            &task_id.to_string(),
+            "--agent",
+            "agent-alpha",
+            "--result",
+            r#"{"criterion":0,"status":"passed","evidence":"cargo test: basic add passed"}"#,
+        ],
+    );
+    assert_eq!(submitted["status"], "review");
+    assert_eq!(submitted["executor"], Value::Null);
+    assert_eq!(submitted["revision"], 1);
+    assert_eq!(submitted["acceptance_results"][0]["status"], "passed");
 
-    // edit fails while claimed
     kanban(&dir)
         .args(["edit", &task_id.to_string(), "--title", "renamed"])
         .assert()
         .failure()
-        .stderr(contains("claimed"));
+        .stderr(contains("in review"));
 
-    // release clears executor and resets status
-    let released = run_json(&dir, &["release", &task_id.to_string()]);
-    assert_eq!(released["executor"], Value::Null);
-    assert_eq!(released["status"], "todo");
-
-    // edit succeeds now
-    let edited = run_json(
+    let review_claim = run_json(
         &dir,
-        &["edit", &task_id.to_string(), "--title", "renamed task"],
+        &[
+            "claim-review",
+            &task_id.to_string(),
+            "--agent",
+            "reviewer-beta",
+        ],
     );
-    assert_eq!(edited["title"], "renamed task");
+    assert_eq!(review_claim["status"], "review");
+    assert_eq!(review_claim["executor"], "reviewer-beta");
+    assert_eq!(review_claim["executor_role"], "reviewer");
 
-    // remove succeeds
-    let removed = run_json(&dir, &["remove", &task_id.to_string()]);
-    assert_eq!(removed["removed"].as_i64().unwrap(), task_id);
+    let approved = run_json(
+        &dir,
+        &[
+            "approve",
+            &task_id.to_string(),
+            "--agent",
+            "reviewer-beta",
+            "--notes",
+            "verified",
+        ],
+    );
+    assert_eq!(approved["status"], "done");
+    assert_eq!(approved["executor"], Value::Null);
+    assert_eq!(approved["review_history"][0]["decision"], "approved");
+    assert_eq!(approved["review_history"][0]["executor"], "reviewer-beta");
+
+    remove_agent_with_no_claims(&dir, "agent-alpha");
+    remove_agent_with_no_claims(&dir, "reviewer-beta");
+
+    let shown = run_json(&dir, &["show", &task_id.to_string()]);
+    assert_eq!(shown["status"], "done");
+    assert_eq!(shown["acceptance_results"][0]["executor"], "agent-alpha");
+    assert_eq!(shown["review_history"][0]["executor"], "reviewer-beta");
+}
+
+#[test]
+fn request_changes_starts_a_new_revision_and_preserves_review_history() {
+    let dir = TempDir::new().unwrap();
+    init(&dir);
+    register(&dir, "developer");
+    register_role(&dir, "reviewer", "reviewer");
+    let created = run_json(
+        &dir,
+        &[
+            "add",
+            "--title",
+            "review twice",
+            "--priority",
+            "high",
+            "--test",
+            r#"{"describe":"behavior","input":"scenario","output":"expected"}"#,
+        ],
+    );
+    let id = created["id"].as_i64().unwrap().to_string();
+
+    run_json(&dir, &["claim", &id, "--agent", "developer"]);
+    run_json(
+        &dir,
+        &[
+            "submit-review",
+            &id,
+            "--agent",
+            "developer",
+            "--result",
+            r#"{"criterion":0,"status":"failed","evidence":"integration test failed"}"#,
+        ],
+    );
+    run_json(&dir, &["claim-review", &id, "--agent", "reviewer"]);
 
     kanban(&dir)
-        .args(["show", &task_id.to_string()])
+        .args(["approve", &id, "--agent", "reviewer"])
         .assert()
         .failure()
-        .stderr(contains("not found"));
+        .stderr(contains("failed acceptance"));
 
-    // agent remove on an agent with no remaining claims
-    let agent_removed = run_json(&dir, &["agent", "remove", "agent-alpha"]);
-    assert_eq!(agent_removed["removed"], "agent-alpha");
-    assert_eq!(agent_removed["released_tasks"].as_array().unwrap().len(), 0);
+    let changes = run_json(
+        &dir,
+        &[
+            "request-changes",
+            &id,
+            "--agent",
+            "reviewer",
+            "--notes",
+            "fix the integration failure",
+        ],
+    );
+    assert_eq!(changes["status"], "in_progress");
+    assert_eq!(changes["executor"], Value::Null);
+    assert_eq!(changes["revision"], 1);
+    assert_eq!(
+        changes["review_history"][0]["decision"],
+        "changes_requested"
+    );
+    assert_eq!(
+        changes["review_history"][0]["notes"],
+        "fix the integration failure"
+    );
+
+    run_json(&dir, &["claim", &id, "--agent", "developer"]);
+    let second_submission = run_json(
+        &dir,
+        &[
+            "submit-review",
+            &id,
+            "--agent",
+            "developer",
+            "--result",
+            r#"{"criterion":0,"status":"passed","evidence":"integration test passed"}"#,
+        ],
+    );
+    assert_eq!(second_submission["revision"], 2);
+    assert_eq!(
+        second_submission["acceptance_results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    run_json(&dir, &["claim-review", &id, "--agent", "reviewer"]);
+    let approved = run_json(&dir, &["approve", &id, "--agent", "reviewer"]);
+    assert_eq!(approved["status"], "done");
+    assert_eq!(approved["review_history"][0]["revision"], 1);
+    assert_eq!(approved["review_history"][1]["revision"], 2);
+    assert_eq!(approved["review_history"][1]["decision"], "approved");
+}
+
+#[test]
+fn expired_lease_is_inactive_and_can_be_reclaimed() {
+    let dir = TempDir::new().unwrap();
+    init(&dir);
+    register(&dir, "developer-a");
+    register(&dir, "developer-b");
+    let created = run_json(
+        &dir,
+        &[
+            "add",
+            "--title",
+            "lease task",
+            "--priority",
+            "medium",
+            "--test",
+            r#"{"describe":"d","input":"i","output":"o"}"#,
+        ],
+    );
+    let id = created["id"].as_i64().unwrap();
+    let id_string = id.to_string();
+    run_json(
+        &dir,
+        &[
+            "claim",
+            &id_string,
+            "--agent",
+            "developer-a",
+            "--lease-seconds",
+            "60",
+        ],
+    );
+
+    let db_path = dir.path().join(".kanban").join("board.db");
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "UPDATE tasks SET lease_expires_at = datetime('now', '-1 second') WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let expired = run_json(&dir, &["show", &id_string]);
+    assert_eq!(expired["status"], "in_progress");
+    assert_eq!(expired["executor"], Value::Null);
+    let status = run_json(&dir, &["status"]);
+    assert_eq!(status["agents"]["developer-a"], 0);
+
+    let reclaimed = run_json(&dir, &["claim", &id_string, "--agent", "developer-b"]);
+    assert_eq!(reclaimed["executor"], "developer-b");
+
+    kanban(&dir)
+        .args(["release", &id_string, "--agent", "developer-a"])
+        .assert()
+        .failure()
+        .stderr(contains("developer-b"));
+    let released = run_json(&dir, &["release", &id_string, "--agent", "developer-b"]);
+    assert_eq!(released["executor"], Value::Null);
+    assert_eq!(released["status"], "in_progress");
+}
+
+#[test]
+fn transition_table_is_exposed_and_generic_move_cannot_bypass_review() {
+    let dir = TempDir::new().unwrap();
+    init(&dir);
+    let transitions = run_json(&dir, &["transitions"]);
+    assert!(transitions.as_array().unwrap().iter().any(|transition| {
+        transition["command"] == "approve"
+            && transition["from"] == "review"
+            && transition["to"] == "done"
+    }));
+    assert!(
+        !transitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|transition| { transition["command"] == "move" && transition["to"] == "done" })
+    );
+
+    let created = run_json(
+        &dir,
+        &[
+            "add",
+            "--title",
+            "cannot skip review",
+            "--priority",
+            "low",
+            "--test",
+            r#"{"describe":"d","input":"i","output":"o"}"#,
+        ],
+    );
+    let id = created["id"].as_i64().unwrap().to_string();
+    kanban(&dir)
+        .args(["move", &id, "--status", "done"])
+        .assert()
+        .failure()
+        .stderr(contains("lifecycle review commands"));
+    let shown = run_json(&dir, &["show", &id]);
+    assert_eq!(shown["status"], "todo");
 }
 
 #[test]
@@ -326,6 +548,8 @@ fn edit_and_remove_blocked_while_claimed() {
 fn edit_and_remove_blocked_when_done() {
     let dir = TempDir::new().unwrap();
     init(&dir);
+    register(&dir, "developer");
+    register_role(&dir, "reviewer", "reviewer");
     let created = run_json(
         &dir,
         &[
@@ -339,7 +563,23 @@ fn edit_and_remove_blocked_when_done() {
         ],
     );
     let id = created["id"].as_i64().unwrap();
-    run_json(&dir, &["move", &id.to_string(), "--status", "done"]);
+    run_json(&dir, &["claim", &id.to_string(), "--agent", "developer"]);
+    run_json(
+        &dir,
+        &[
+            "submit-review",
+            &id.to_string(),
+            "--agent",
+            "developer",
+            "--result",
+            r#"{"criterion":0,"status":"passed","evidence":"verified"}"#,
+        ],
+    );
+    run_json(
+        &dir,
+        &["claim-review", &id.to_string(), "--agent", "reviewer"],
+    );
+    run_json(&dir, &["approve", &id.to_string(), "--agent", "reviewer"]);
 
     kanban(&dir)
         .args(["edit", &id.to_string(), "--title", "x"])
@@ -398,7 +638,7 @@ fn agent_remove_cascade_releases_claimed_task() {
 
     let shown = run_json(&dir, &["show", &id.to_string()]);
     assert_eq!(shown["executor"], Value::Null);
-    assert_eq!(shown["status"], "todo");
+    assert_eq!(shown["status"], "in_progress");
 }
 
 #[test]
@@ -1037,7 +1277,7 @@ fn init_sets_schema_version_pragma() {
     let version: i32 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 /// Opening a project whose schema version is newer than this binary
@@ -1070,6 +1310,7 @@ fn status_reports_task_counts_and_agent_workload() {
     register(&dir, "alice");
     register(&dir, "bob");
     register(&dir, "carol");
+    register_role(&dir, "reviewer", "reviewer");
 
     let test_json = r#"{"describe":"d","input":"i","output":"o"}"#;
     for title in ["t1", "t2", "t3"] {
@@ -1094,10 +1335,19 @@ fn status_reports_task_counts_and_agent_workload() {
         .args(["claim", "2", "--agent", "bob"])
         .assert()
         .success();
-    kanban(&dir)
-        .args(["move", "2", "--status", "done"])
-        .assert()
-        .success();
+    run_json(
+        &dir,
+        &[
+            "submit-review",
+            "2",
+            "--agent",
+            "bob",
+            "--result",
+            r#"{"criterion":0,"status":"passed","evidence":"verified"}"#,
+        ],
+    );
+    run_json(&dir, &["claim-review", "2", "--agent", "reviewer"]);
+    run_json(&dir, &["approve", "2", "--agent", "reviewer"]);
 
     let status = run_json(&dir, &["status"]);
     assert_eq!(status["backlog"], 0);
@@ -1107,6 +1357,7 @@ fn status_reports_task_counts_and_agent_workload() {
     assert_eq!(status["done"], 1);
     assert_eq!(status["total"], 3);
     assert_eq!(status["agents"]["alice"], 1);
-    assert_eq!(status["agents"]["bob"], 1);
+    assert_eq!(status["agents"]["bob"], 0);
     assert_eq!(status["agents"]["carol"], 0);
+    assert_eq!(status["agents"]["reviewer"], 0);
 }
