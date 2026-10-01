@@ -1,36 +1,78 @@
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction};
-use serde_json::{Value, json};
 
-pub fn register(name: &str, role: &str) -> Result<Value> {
+/// What an agent is allowed to do: developers claim and submit work,
+/// reviewers claim submitted work and decide on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    Developer,
+    Reviewer,
+}
+
+impl Role {
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "developer" => Some(Self::Developer),
+            "reviewer" => Some(Self::Reviewer),
+            _ => None,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Reviewer => "reviewer",
+        }
+    }
+
+    /// The statuses a task can be claimed from (reviewers: one, listed twice).
+    pub const fn claim_from(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Developer => ("todo", "in_progress"),
+            Self::Reviewer => ("review", "review"),
+        }
+    }
+
+    /// The status of a task while this role holds it; claiming moves it here
+    /// and `release` requires it.
+    pub const fn holds(self) -> &'static str {
+        match self {
+            Self::Developer => "in_progress",
+            Self::Reviewer => "review",
+        }
+    }
+
+    /// Developers may only start work whose prerequisites are done.
+    pub const fn needs_ready(self) -> bool {
+        matches!(self, Self::Developer)
+    }
+}
+
+/// `agent register NAME [--role R]` -> `NAME ROLE`.
+pub fn register(name: &str, role: &str) -> Result<String> {
     let conn = crate::db::open_existing()?;
     register_inner(&conn, name, role)
 }
 
-fn register_inner(conn: &Connection, name: &str, role: &str) -> Result<Value> {
+fn register_inner(conn: &Connection, name: &str, role: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
         bail!("agent name must not be empty or whitespace-only");
     }
-    if !matches!(role, "developer" | "reviewer") {
-        bail!("invalid role '{role}': must be developer or reviewer");
+    if name.contains(char::is_whitespace) {
+        bail!("agent name '{name}' must not contain whitespace");
     }
+    let Some(role) = Role::parse(role) else {
+        bail!("invalid role '{role}': must be developer or reviewer");
+    };
 
     let result = conn.execute(
         "INSERT INTO agents (name, role) VALUES (?1, ?2)",
-        rusqlite::params![name, role],
+        rusqlite::params![name, role.name()],
     );
 
     match result {
-        Ok(_) => {
-            let id = conn.last_insert_rowid();
-            let (id, name, role, created_at): (i64, String, String, String) = conn.query_row(
-                "SELECT id, name, role, created_at FROM agents WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
-            Ok(json!({"id": id, "name": name, "role": role, "created_at": created_at}))
-        }
+        Ok(_) => Ok(format!("{name} {}", role.name())),
         Err(rusqlite::Error::SqliteFailure(ffi_err, _))
             if ffi_err.code == rusqlite::ErrorCode::ConstraintViolation =>
         {
@@ -40,27 +82,30 @@ fn register_inner(conn: &Connection, name: &str, role: &str) -> Result<Value> {
     }
 }
 
-/// `agent-kanban agent list`
-pub fn list() -> Result<Value> {
+/// `agent list` -> one `NAME ROLE` line per agent.
+pub fn list() -> Result<String> {
     let conn = crate::db::open_existing()?;
     list_inner(&conn)
 }
 
-fn list_inner(conn: &Connection) -> Result<Value> {
-    let mut stmt = conn.prepare("SELECT id, name, role, created_at FROM agents ORDER BY name")?;
+fn list_inner(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT name, role FROM agents ORDER BY name")?;
     let rows = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        let name: String = row.get(1)?;
-        let role: String = row.get(2)?;
-        let created_at: String = row.get(3)?;
-        Ok(json!({"id": id, "name": name, "role": role, "created_at": created_at}))
+        Ok(format!(
+            "{} {}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?
+        ))
     })?;
-
-    let agents: std::result::Result<Vec<Value>, rusqlite::Error> = rows.collect();
-    Ok(Value::Array(agents?))
+    let lines = rows.collect::<std::result::Result<Vec<String>, rusqlite::Error>>()?;
+    if lines.is_empty() {
+        return Ok("no agents".to_string());
+    }
+    Ok(lines.join("\n"))
 }
 
-pub fn remove(name: &str) -> Result<Value> {
+/// `agent remove NAME` -> `NAME removed[, released #IDS]`.
+pub fn remove(name: &str) -> Result<String> {
     let mut conn = crate::db::open_existing()?;
     // Must be `Immediate`, not the default `Deferred`: a deferred transaction
     // starts with a read (the SELECT below) and only acquires the write lock
@@ -78,7 +123,7 @@ pub fn remove(name: &str) -> Result<Value> {
     Ok(result)
 }
 
-fn remove_inner(tx: &Transaction, name: &str) -> Result<Value> {
+fn remove_inner(tx: &Transaction, name: &str) -> Result<String> {
     let id: Option<i64> = tx
         .query_row("SELECT id FROM agents WHERE name = ?1", [name], |row| {
             row.get(0)
@@ -118,7 +163,13 @@ fn remove_inner(tx: &Transaction, name: &str) -> Result<Value> {
         bail!("agent '{name}' not found");
     }
 
-    Ok(json!({"removed": name, "released_tasks": released_tasks}))
+    let released = if released_tasks.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<String> = released_tasks.iter().map(|id| format!("#{id}")).collect();
+        format!(", released {}", ids.join(","))
+    };
+    Ok(format!("{name} removed{released}"))
 }
 
 #[cfg(test)]
@@ -131,6 +182,13 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         conn.execute_batch(crate::db::SCHEMA).unwrap();
         conn
+    }
+
+    fn agent_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM agents WHERE name = ?1", [name], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     /// A file-backed (not in-memory) connection, needed for tests that rely
@@ -178,13 +236,39 @@ mod tests {
     }
 
     #[test]
-    fn register_succeeds_and_returns_expected_json() {
+    fn register_replies_with_name_and_role() {
         let conn = setup();
-        let result = register_inner(&conn, "agent-1", "developer").unwrap();
-        assert_eq!(result["name"], "agent-1");
-        assert_eq!(result["role"], "developer");
-        assert!(result["id"].is_i64());
-        assert!(result["created_at"].is_string());
+        assert_eq!(
+            register_inner(&conn, "agent-1", "developer").unwrap(),
+            "agent-1 developer"
+        );
+        assert_eq!(
+            register_inner(&conn, "agent-2", "reviewer").unwrap(),
+            "agent-2 reviewer"
+        );
+    }
+
+    #[test]
+    fn register_rejects_names_that_would_break_line_output() {
+        let conn = setup();
+        let err = register_inner(&conn, "two words", "developer").unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err}");
+        let err = register_inner(&conn, "tab\tbed", "developer").unwrap_err();
+        assert!(err.to_string().contains("whitespace"), "{err}");
+    }
+
+    #[test]
+    fn role_knows_what_it_claims_and_holds() {
+        assert_eq!(Role::parse("developer"), Some(Role::Developer));
+        assert_eq!(Role::parse("reviewer"), Some(Role::Reviewer));
+        assert_eq!(Role::parse("writer"), None);
+        assert_eq!(Role::Developer.claim_from(), ("todo", "in_progress"));
+        assert_eq!(Role::Reviewer.claim_from(), ("review", "review"));
+        assert_eq!(Role::Developer.holds(), "in_progress");
+        assert_eq!(Role::Reviewer.holds(), "review");
+        assert!(Role::Developer.needs_ready());
+        assert!(!Role::Reviewer.needs_ready());
+        assert_eq!(Role::parse(Role::Reviewer.name()), Some(Role::Reviewer));
     }
 
     #[test]
@@ -214,21 +298,24 @@ mod tests {
         let conn = setup();
         register_inner(&conn, "bravo", "reviewer").unwrap();
         register_inner(&conn, "alpha", "developer").unwrap();
-        let result = list_inner(&conn).unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        // ordered by name
-        assert_eq!(arr[0]["name"], "alpha");
-        assert_eq!(arr[0]["role"], "developer");
-        assert_eq!(arr[1]["name"], "bravo");
-        assert_eq!(arr[1]["role"], "reviewer");
+        // one line per agent, ordered by name
+        assert_eq!(
+            list_inner(&conn).unwrap(),
+            "alpha developer\nbravo reviewer"
+        );
+    }
+
+    #[test]
+    fn list_without_agents_says_so() {
+        let conn = setup();
+        assert_eq!(list_inner(&conn).unwrap(), "no agents");
     }
 
     #[test]
     fn remove_cascades_and_releases_tasks() {
         let mut conn = setup();
-        let agent = register_inner(&conn, "agent-1", "developer").unwrap();
-        let agent_id = agent["id"].as_i64().unwrap();
+        register_inner(&conn, "agent-1", "developer").unwrap();
+        let agent_id = agent_id(&conn, "agent-1");
 
         conn.execute(
             "INSERT INTO tasks (
@@ -246,9 +333,7 @@ mod tests {
         let result = remove_inner(&tx, "agent-1").unwrap();
         tx.commit().unwrap();
 
-        assert_eq!(result["removed"], "agent-1");
-        assert_eq!(result["released_tasks"].as_array().unwrap().len(), 1);
-        assert_eq!(result["released_tasks"][0], 1);
+        assert_eq!(result, "agent-1 removed, released #1");
 
         let (executor, status, updated_at): (Option<i64>, String, String) = conn
             .query_row(
@@ -287,8 +372,8 @@ mod tests {
              BEGIN DELETE FROM agents WHERE id = OLD.executor; END;",
         )
         .unwrap();
-        let agent = register_inner(&conn, "agent-1", "developer").unwrap();
-        let agent_id = agent["id"].as_i64().unwrap();
+        register_inner(&conn, "agent-1", "developer").unwrap();
+        let agent_id = agent_id(&conn, "agent-1");
         conn.execute(
             "INSERT INTO tasks (
                id, title, priority, status, executor, tests, claimed_at, lease_expires_at
@@ -316,12 +401,18 @@ mod tests {
     #[test]
     fn register_trims_whitespace() {
         let conn = setup();
-        let result = register_inner(&conn, "  alice  ", "developer").unwrap();
-        assert_eq!(result["name"], "alice");
+        assert_eq!(
+            register_inner(&conn, "  alice  ", "developer").unwrap(),
+            "alice developer"
+        );
+        assert_eq!(list_inner(&conn).unwrap(), "alice developer");
+    }
 
-        let list = list_inner(&conn).unwrap();
-        let arr = list.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["name"], "alice");
+    #[test]
+    fn remove_without_tasks_reports_nothing_released() {
+        let mut conn = setup();
+        register_inner(&conn, "agent-1", "developer").unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(remove_inner(&tx, "agent-1").unwrap(), "agent-1 removed");
     }
 }

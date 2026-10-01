@@ -2,29 +2,23 @@ mod commands;
 mod db;
 mod output;
 
+use anyhow::{Result, anyhow};
 use clap::error::ErrorKind;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+
+use commands::lifecycle::{self, DEFAULT_LEASE_SECONDS};
+use commands::task::{ListFilter, NewTask, TaskEdit};
 
 #[derive(Parser)]
 #[command(
     name = "agent-kanban",
-    about = "Kanban board for concurrent LLM agents",
+    about = "Task board for concurrent LLM agents. Run `agent-kanban guide` first",
     version
 )]
 struct Cli {
-    /// Indent JSON output.
-    #[arg(long, global = true, conflicts_with = "table")]
-    pretty: bool,
-
-    /// Render output as a human-readable table instead of JSON.
-    #[arg(long, global = true)]
-    table: bool,
-
-    /// Use this exact database file instead of discovering `.kanban/` by
-    /// walking up from the current directory. For `init`, creates the
-    /// database here (making parent directories as needed) instead of at
-    /// the default `.kanban/board.db`.
+    /// Database file; default: the nearest `.kanban/board.db` above the
+    /// current directory (`init` creates it here)
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
 
@@ -32,220 +26,276 @@ struct Cli {
     command: Command,
 }
 
+/// Who is acting. Every command that claims or finishes work needs it.
+#[derive(Args)]
+struct Who {
+    /// Your registered agent name
+    #[arg(long, env = "AGENT_KANBAN_AGENT", value_name = "NAME")]
+    agent: Option<String>,
+}
+
+impl Who {
+    fn name(&self) -> Result<&str> {
+        self.agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("no agent name: pass --agent NAME or set AGENT_KANBAN_AGENT"))
+    }
+}
+
+#[derive(Args)]
+struct Lease {
+    /// Seconds before another agent may take the task over; claiming again
+    /// renews it
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_LEASE_SECONDS)]
+    lease: u32,
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Create `.kanban/board.db` in the current directory.
+    /// Create `.kanban/board.db` in the current directory
     Init,
 
-    /// Manage registered agents.
+    /// Print the usage guide (read this first)
+    Guide,
+
+    /// Register, list and remove agents
     Agent {
         #[command(subcommand)]
         action: AgentAction,
     },
 
-    /// Create a task. `--test` may be repeated; each is a JSON object
-    /// `{"describe","input","output"}`. At least one `--test` is required.
+    /// Create a task
     Add {
-        /// Task title.
-        #[arg(long)]
+        /// Task title
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
-        /// Priority: low, medium, high, or urgent.
-        #[arg(long)]
+        /// low, medium, high or urgent
+        #[arg(long, default_value = "medium")]
         priority: String,
-        /// Tag to attach (repeatable).
-        #[arg(long = "tag")]
+        /// Tag to attach (repeatable)
+        #[arg(long = "tag", value_name = "TAG", allow_hyphen_values = true)]
         tags: Vec<String>,
-        /// A test spec as JSON: {"describe","input","output"} (repeatable,
-        /// at least one required).
-        #[arg(long = "test", required = true)]
+        /// Acceptance test: what it checks, its input, its expected output
+        /// (repeatable; at least one)
+        #[arg(
+            long = "test",
+            num_args = 3,
+            value_names = ["DESC", "INPUT", "OUTPUT"],
+            required = true,
+            allow_hyphen_values = true
+        )]
         tests: Vec<String>,
+        /// Ids of tasks this one waits for (comma-separated or repeated)
+        #[arg(long, value_delimiter = ',', value_parser = parse_id, value_name = "IDS")]
+        after: Vec<i64>,
     },
 
-    /// List tasks, optionally filtered and sorted.
+    /// List tasks, one line each
     List {
-        /// Filter by status.
+        /// Only tasks in this status
         #[arg(long)]
         status: Option<String>,
-        /// Filter by tag.
+        /// Only tasks with this tag
         #[arg(long)]
         tag: Option<String>,
-        /// Filter by claiming agent's name.
+        /// Only tasks this agent holds
         #[arg(long)]
         executor: Option<String>,
-        /// Filter by priority.
+        /// Only tasks with this priority
         #[arg(long)]
         priority: Option<String>,
-        /// Sort order: priority (by severity, not alphabetically) or `created_at`.
+        /// Include done tasks
         #[arg(long)]
-        sort: Option<String>,
+        all: bool,
+        /// Print at most N tasks
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
     },
 
-    /// Show a single task.
+    /// Show one task: a header line, then its tags, notes and tests
     Show {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
+        /// Also list every past revision with its results and review
+        #[arg(long)]
+        history: bool,
     },
 
-    /// Claim development work for a developer.
+    /// Claim one task and print its work order
     Claim {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// Registered developer name.
-        #[arg(long)]
-        agent: String,
-        /// Claim lease duration in seconds.
-        #[arg(long, default_value_t = commands::lifecycle::DEFAULT_LEASE_SECONDS)]
-        lease_seconds: u32,
+        #[command(flatten)]
+        who: Who,
+        #[command(flatten)]
+        lease: Lease,
     },
 
-    /// Submit completed development work for review.
+    /// Claim the best available task, or print `idle`
+    ClaimNext {
+        #[command(flatten)]
+        who: Who,
+        #[command(flatten)]
+        lease: Lease,
+    },
+
+    /// Hand finished work to a reviewer
     SubmitReview {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// Developer currently holding the task.
-        #[arg(long)]
-        agent: String,
-        /// Acceptance result JSON: {"criterion":0,"status":"passed|failed","evidence":"..."}.
-        #[arg(long = "result", required = true)]
-        results: Vec<String>,
+        #[command(flatten)]
+        who: Who,
+        /// Test IDX passed; EVIDENCE says how you know (repeatable)
+        #[arg(
+            long,
+            num_args = 2,
+            value_names = ["IDX", "EVIDENCE"],
+            allow_hyphen_values = true
+        )]
+        pass: Vec<String>,
+        /// Test IDX failed; EVIDENCE says what went wrong (repeatable)
+        #[arg(
+            long,
+            num_args = 2,
+            value_names = ["IDX", "EVIDENCE"],
+            allow_hyphen_values = true
+        )]
+        fail: Vec<String>,
     },
 
-    /// Claim a task in review for a reviewer.
-    ClaimReview {
-        /// Task id.
-        id: i64,
-        /// Registered reviewer name.
-        #[arg(long)]
-        agent: String,
-        /// Claim lease duration in seconds.
-        #[arg(long, default_value_t = commands::lifecycle::DEFAULT_LEASE_SECONDS)]
-        lease_seconds: u32,
-    },
-
-    /// Approve the current review revision and finish the task.
+    /// Approve reviewed work; the task becomes done
     Approve {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// Reviewer currently holding the task.
-        #[arg(long)]
-        agent: String,
-        /// Review notes.
-        #[arg(long, default_value = "")]
+        #[command(flatten)]
+        who: Who,
+        /// Remarks to keep in the history
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
         notes: String,
     },
 
-    /// Return the current review revision to development.
+    /// Send reviewed work back to development
     RequestChanges {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// Reviewer currently holding the task.
-        #[arg(long)]
-        agent: String,
-        /// Required review findings or requested changes.
-        #[arg(long)]
+        #[command(flatten)]
+        who: Who,
+        /// What must change; the developer sees this when claiming
+        #[arg(long, allow_hyphen_values = true)]
         notes: String,
     },
 
-    /// Move an unclaimed task between backlog and todo.
+    /// Park an unclaimed task in backlog, or put it back in todo
     Move {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// New status: backlog or todo.
-        #[arg(long)]
+        /// backlog or todo
         status: String,
     },
 
-    /// Release a task without changing its status.
+    /// Give a claimed task back, keeping its status
     Release {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// Agent currently holding the task.
-        #[arg(long)]
-        agent: String,
+        #[command(flatten)]
+        who: Who,
     },
 
-    /// Edit an unowned task outside review and done.
+    /// Change an unclaimed task that is not in review or done
     Edit {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
-        /// New title.
-        #[arg(long)]
+        /// New title
+        #[arg(long, allow_hyphen_values = true)]
         title: Option<String>,
-        /// New priority: low, medium, high, or urgent.
+        /// New priority: low, medium, high or urgent
         #[arg(long)]
         priority: Option<String>,
-        /// Replace tags with this set (repeatable).
-        #[arg(long = "tag")]
+        /// Replace all tags with these (repeatable)
+        #[arg(long = "tag", value_name = "TAG", allow_hyphen_values = true)]
         tags: Option<Vec<String>>,
-        /// Replace tests with this set (repeatable); same shape as `add`'s
-        /// `--test`.
-        #[arg(long = "test")]
+        /// Replace all tests with these (repeatable; same shape as in `add`)
+        #[arg(
+            long = "test",
+            num_args = 3,
+            value_names = ["DESC", "INPUT", "OUTPUT"],
+            allow_hyphen_values = true
+        )]
         tests: Option<Vec<String>>,
+        /// Also wait for these tasks (comma-separated or repeated)
+        #[arg(long, value_delimiter = ',', value_parser = parse_id, value_name = "IDS")]
+        after: Vec<i64>,
+        /// Stop waiting for these tasks
+        #[arg(
+            long = "drop-after",
+            value_delimiter = ',',
+            value_parser = parse_id,
+            value_name = "IDS"
+        )]
+        drop_after: Vec<i64>,
     },
 
-    /// Hard-delete an unowned task outside review and done.
+    /// Delete an unclaimed task that is not in review or done
     Remove {
-        /// Task id.
+        /// Task id
+        #[arg(value_parser = parse_id)]
         id: i64,
     },
 
-    /// Board overview: task counts per status column plus each registered
-    /// agent's current claimed-task count.
+    /// Counts per status, and the tasks each agent holds
     Status,
-
-    /// Show the lifecycle transition table enforced by mutation commands.
-    Transitions,
 }
 
 #[derive(Subcommand)]
 enum AgentAction {
-    /// Register a new agent name and role.
+    /// Register an agent name
     Register {
-        /// Agent name to register.
+        /// Agent name (no spaces)
         name: String,
-        /// Agent role: developer or reviewer.
+        /// developer or reviewer
         #[arg(long, default_value = "developer")]
         role: String,
     },
-    /// List registered agents.
+    /// List agents, one `NAME ROLE` line each
     List,
-    /// Remove an agent, auto-releasing any tasks it holds.
+    /// Remove an agent, releasing the tasks it holds
     Remove {
-        /// Agent name to remove.
+        /// Agent name
         name: String,
     },
 }
 
-fn main() {
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(err) => {
-            // --help/--version aren't errors -- print them exactly as clap
-            // normally would (human-readable, exit 0), not as JSON.
-            if matches!(
-                err.kind(),
-                ErrorKind::DisplayHelp
-                    | ErrorKind::DisplayVersion
-                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            ) {
-                err.exit();
-            }
-            // Every other parse failure (bad flag, non-numeric id, missing
-            // required argument, unknown subcommand) must still honor this
-            // tool's JSON error contract -- `Cli::parse()` would otherwise
-            // print clap's own multi-line human-readable text here instead,
-            // which the rest of this program's error handling deliberately
-            // avoids everywhere else.
-            output::fail_with_code(&err.to_string(), err.exit_code(), output::Format::Compact);
-        }
-    };
+/// Task ids are plain numbers, but replies print them as `#7`, so accept that
+/// spelling too.
+fn parse_id(text: &str) -> Result<i64, String> {
+    text.trim()
+        .trim_start_matches('#')
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| format!("'{text}' is not a task id"))
+}
 
-    if let Some(path) = cli.db.clone() {
-        db::set_path_override(path);
-    }
+/// clap hands a repeatable multi-value flag over as one flat list; each use
+/// of the flag contributed exactly `size` values, so cut it back into uses.
+fn group(values: &[String], size: usize) -> Vec<Vec<String>> {
+    values.chunks(size).map(<[String]>::to_vec).collect()
+}
 
-    let result = match cli.command {
+fn run(command: Command) -> Result<String> {
+    match command {
         Command::Init => commands::init(),
+        Command::Guide => Ok(commands::guide()),
         Command::Agent { action } => match action {
             AgentAction::Register { name, role } => commands::agent::register(&name, &role),
             AgentAction::List => commands::agent::list(),
@@ -256,56 +306,96 @@ fn main() {
             priority,
             tags,
             tests,
-        } => commands::task::add(&title, &priority, &tags, &tests),
+            after,
+        } => commands::task::add(&NewTask {
+            title,
+            priority,
+            tags,
+            tests: group(&tests, 3),
+            after,
+        }),
         Command::List {
             status,
             tag,
             executor,
             priority,
-            sort,
-        } => commands::task::list(status, tag, executor, priority, sort.as_deref()),
-        Command::Show { id } => commands::task::show(id),
-        Command::Claim {
-            id,
-            agent,
-            lease_seconds,
-        } => commands::lifecycle::claim(id, &agent, lease_seconds),
-        Command::SubmitReview { id, agent, results } => {
-            commands::lifecycle::submit_review(id, &agent, &results)
-        }
-        Command::ClaimReview {
-            id,
-            agent,
-            lease_seconds,
-        } => commands::lifecycle::claim_review(id, &agent, lease_seconds),
-        Command::Approve { id, agent, notes } => commands::lifecycle::approve(id, &agent, &notes),
-        Command::RequestChanges { id, agent, notes } => {
-            commands::lifecycle::request_changes(id, &agent, &notes)
-        }
-        Command::Move { id, status } => commands::lifecycle::move_status(id, &status),
-        Command::Release { id, agent } => commands::lifecycle::release(id, &agent),
+            all,
+            limit,
+        } => commands::task::list(&ListFilter {
+            status,
+            tag,
+            executor,
+            priority,
+            all,
+            limit: limit.unwrap_or(0),
+        }),
+        Command::Show { id, history } => commands::task::show(id, history),
         Command::Edit {
             id,
             title,
             priority,
             tags,
             tests,
-        } => commands::task::edit(id, title, priority, tags, tests.as_deref()),
+            after,
+            drop_after,
+        } => commands::task::edit(
+            id,
+            &TaskEdit {
+                title,
+                priority,
+                tags,
+                tests: tests.map(|tests| group(&tests, 3)),
+                after,
+                drop_after,
+            },
+        ),
         Command::Remove { id } => commands::task::remove(id),
         Command::Status => commands::status::status(),
-        Command::Transitions => Ok(commands::lifecycle::transitions()),
+        Command::Move { id, status } => lifecycle::move_status(id, &status),
+        Command::Claim { id, who, lease } => lifecycle::claim(id, who.name()?, lease.lease),
+        Command::ClaimNext { who, lease } => lifecycle::claim_next(who.name()?, lease.lease),
+        Command::SubmitReview {
+            id,
+            who,
+            pass,
+            fail,
+        } => lifecycle::submit_review(
+            id,
+            who.name()?,
+            &lifecycle::parse_verdicts(&group(&pass, 2), &group(&fail, 2))?,
+        ),
+        Command::Approve { id, who, notes } => lifecycle::approve(id, who.name()?, &notes),
+        Command::RequestChanges { id, who, notes } => {
+            lifecycle::request_changes(id, who.name()?, &notes)
+        }
+        Command::Release { id, who } => lifecycle::release(id, who.name()?),
+    }
+}
+
+fn main() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // --help and --version are not errors: print them the way clap
+            // normally does and exit 0.
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                err.exit();
+            }
+            output::fail_usage(&err.to_string(), err.exit_code());
+        }
     };
 
-    let format = if cli.table {
-        output::Format::Table
-    } else if cli.pretty {
-        output::Format::Pretty
-    } else {
-        output::Format::Compact
-    };
+    if let Some(path) = cli.db {
+        db::set_path_override(path);
+    }
 
-    match result {
-        Ok(value) => output::print(&value, format),
-        Err(err) => output::fail(&err, format),
+    match run(cli.command) {
+        Ok(reply) => output::print(&reply),
+        Err(err) => output::fail(&err),
     }
 }

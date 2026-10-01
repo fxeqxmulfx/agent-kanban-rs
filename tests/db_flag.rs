@@ -1,234 +1,273 @@
-//! Tests for the global `--db <path>` override, which points every command
-//! at an exact database file instead of the usual `.kanban/` directory
-//! discovery.
+//! Tests for the global `--db <path>` flag, which points every command at an
+//! exact database file instead of the usual `.kanban/` directory discovery.
 
-use assert_cmd::Command;
-use serde_json::Value;
-use tempfile::TempDir;
+mod common;
 
-fn kanban() -> Command {
-    Command::cargo_bin("agent-kanban").unwrap()
+use std::path::Path;
+
+/// `args` prefixed with `--db PATH`.
+fn with_db<'a>(db: &'a Path, args: &[&'a str]) -> Vec<&'a str> {
+    let mut full = vec!["--db", db.to_str().unwrap()];
+    full.extend_from_slice(args);
+    full
 }
 
-fn run_json(db_path: &std::path::Path, args: &[&str]) -> Value {
-    let mut full_args = vec!["--db", db_path.to_str().unwrap()];
-    full_args.extend_from_slice(args);
-    let output = kanban().args(&full_args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "command {:?} failed: stdout={} stderr={}",
-        full_args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
-        panic!(
-            "invalid JSON from {:?}: {e}\nstdout={}",
-            full_args,
-            String::from_utf8_lossy(&output.stdout)
-        )
-    })
+/// Run `args` against the board at `db`, from a directory that has no board of
+/// its own.
+fn run_db(cwd: &Path, db: &Path, args: &[&str]) -> String {
+    common::run(cwd, &with_db(db, args))
 }
 
 /// `--db` points `init` at an exact file, creating parent directories as
-/// needed, instead of the default `.kanban/board.db`. Normal (no `--db`)
-/// discovery run from the same directory afterward must find nothing --
-/// the override never creates a `.kanban/` directory.
+/// needed, instead of the default `.kanban/board.db`. Normal discovery from the
+/// same directory afterwards must find nothing: the override never creates a
+/// `.kanban/` directory.
 #[test]
-fn db_flag_creates_exact_path_and_parent_dirs() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("nested").join("my-board.db");
-    assert!(!db_path.parent().unwrap().exists());
+fn db_flag_creates_the_exact_path_and_its_parent_directories() {
+    let dir = common::project();
+    let db = dir.path().join("nested").join("my-board.db");
+    assert!(!db.parent().unwrap().exists());
 
-    run_json(&db_path, &["init"]);
-    assert!(db_path.is_file());
+    assert_eq!(run_db(dir.path(), &db, &["init"]), "initialized");
 
-    // Discovery without --db, run from the same directory, must not find
-    // this file -- the override doesn't create a `.kanban/` anywhere.
-    let mut cmd = kanban();
-    cmd.current_dir(&dir).arg("list");
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("not a kanban project"));
+    assert!(db.is_file());
+    assert!(!dir.path().join(".kanban").exists());
+    assert!(
+        common::fail(&dir, &["list"]).starts_with("error: not a kanban project"),
+        "discovery must not find a board created with --db"
+    );
 }
 
-/// The full task lifecycle works normally through the override, not just
-/// `init`.
 #[test]
-fn db_flag_supports_full_lifecycle() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("board.db");
+fn the_whole_lifecycle_works_through_the_override() {
+    let dir = common::project();
+    let db = dir.path().join("board.db");
 
-    run_json(&db_path, &["init"]);
-    run_json(&db_path, &["agent", "register", "alice"]);
-    let created = run_json(
-        &db_path,
+    run_db(dir.path(), &db, &["init"]);
+    assert_eq!(
+        run_db(dir.path(), &db, &["agent", "register", "alice"]),
+        "alice developer"
+    );
+    assert_eq!(
+        run_db(
+            dir.path(),
+            &db,
+            &[
+                "add",
+                "--title",
+                "t",
+                "--priority",
+                "low",
+                "--test",
+                "d",
+                "i",
+                "o"
+            ]
+        ),
+        "#1 todo"
+    );
+
+    let order = run_db(dir.path(), &db, &["claim", "1", "--agent", "alice"]);
+    assert_eq!(order, "#1 t\n0|d|i|o");
+    assert_eq!(
+        run_db(dir.path(), &db, &["list"]),
+        "#1 low in_progress@alice t"
+    );
+    assert_eq!(
+        run_db(
+            dir.path(),
+            &db,
+            &[
+                "submit-review",
+                "1",
+                "--agent",
+                "alice",
+                "--pass",
+                "0",
+                "ok"
+            ]
+        ),
+        "#1 review rev1"
+    );
+}
+
+/// A non-`init` command against a `--db` path that does not exist must fail
+/// cleanly, not silently create an empty schema-less file (`SQLite`'s default)
+/// and then surface a raw "no such table".
+#[test]
+fn a_missing_database_file_fails_cleanly_and_is_not_created() {
+    let dir = common::project();
+    let db = dir.path().join("does-not-exist.db");
+
+    let err = common::fail(&dir, &with_db(&db, &["list"]));
+
+    assert!(err.starts_with("error: database file "), "{err}");
+    assert!(err.contains("not found; run `agent-kanban --db "), "{err}");
+    assert!(err.ends_with("init` first"), "{err}");
+    assert!(!db.exists(), "a failed lookup must not leave a file behind");
+}
+
+/// `--db` beats a board found by walking up from the working directory, and
+/// the two boards never see each other's data.
+#[test]
+fn the_flag_wins_over_a_discovered_board_and_boards_stay_independent() {
+    let project = common::initialized();
+    common::register(&project, "alice", "developer");
+    common::add_task(&project, "in the project board", "medium");
+
+    let elsewhere = common::project();
+    let other = elsewhere.path().join("other.db");
+    run_db(elsewhere.path(), &other, &["init"]);
+    run_db(
+        elsewhere.path(),
+        &other,
         &[
             "add",
             "--title",
-            "t",
-            "--priority",
-            "low",
+            "in the other board",
             "--test",
-            r#"{"describe":"d","input":"i","output":"o"}"#,
+            "d",
+            "i",
+            "o",
         ],
     );
-    let id = created["id"].as_i64().unwrap().to_string();
 
-    let claimed = run_json(&db_path, &["claim", &id, "--agent", "alice"]);
-    assert_eq!(claimed["executor"], "alice");
-    assert_eq!(claimed["status"], "in_progress");
-
-    let listed = run_json(&db_path, &["list"]);
-    assert_eq!(listed.as_array().unwrap().len(), 1);
+    // Same working directory (which has `.kanban/`), different boards.
+    assert_eq!(
+        common::run(&project, &["list"]),
+        "#1 medium todo in the project board"
+    );
+    assert_eq!(
+        run_db(project.path(), &other, &["list"]),
+        "#1 medium todo in the other board"
+    );
+    assert_eq!(
+        run_db(project.path(), &other, &["agent", "list"]),
+        "no agents"
+    );
+    assert_eq!(common::run(&project, &["agent", "list"]), "alice developer");
 }
 
-/// Running a non-`init` command against a `--db` path that doesn't exist
-/// yet must fail with a clean error, not silently create an empty,
-/// schema-less database file via `SQLite`'s default auto-create behavior
-/// (confirmed this was the actual failure mode before the fix: it created
-/// a 0-byte-schema file and then surfaced a raw "no such table: tasks").
 #[test]
-fn db_flag_on_nonexistent_file_fails_cleanly_without_creating_it() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("does-not-exist.db");
+fn relative_paths_resolve_against_the_working_directory() {
+    let dir = common::project();
 
-    let mut cmd = kanban();
-    cmd.args(["--db", db_path.to_str().unwrap(), "list"]);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("not found"));
+    common::run(&dir, &["--db", "sub/rel.db", "init"]);
+    assert!(dir.path().join("sub").join("rel.db").is_file());
+    common::run(
+        &dir,
+        &[
+            "--db",
+            "sub/rel.db",
+            "add",
+            "--title",
+            "x",
+            "--test",
+            "d",
+            "i",
+            "o",
+        ],
+    );
 
-    assert!(
-        !db_path.exists(),
-        "a failed lookup must not leave behind an empty database file"
+    let nested = dir.path().join("sub");
+    assert_eq!(
+        common::run(&nested, &["--db", "rel.db", "list"]),
+        "#1 medium todo x"
     );
 }
 
-/// If `--db`'s parent directory can't actually be created (e.g. permission
-/// denied), `init` must propagate that error rather than silently
-/// succeeding or panicking. Unix-only (relies on chmod). Not defended
-/// against running as root (which bypasses permission checks entirely) --
-/// not a scenario this suite otherwise needs to accommodate.
+#[test]
+fn paths_with_spaces_and_unicode_work() {
+    let dir = common::project();
+    let db = dir.path().join("my boards").join("доска №1.db");
+
+    run_db(dir.path(), &db, &["init"]);
+    run_db(
+        dir.path(),
+        &db,
+        &["add", "--title", "задача", "--test", "d", "i", "o"],
+    );
+
+    assert_eq!(run_db(dir.path(), &db, &["list"]), "#1 medium todo задача");
+}
+
+/// `--db` is declared `global`, so it works in any position, not only before
+/// the subcommand.
+#[test]
+fn the_flag_works_before_and_after_the_subcommand() {
+    let dir = common::project();
+    let db = dir.path().join("board.db");
+    let db = db.to_str().unwrap();
+
+    assert_eq!(common::run(&dir, &["init", "--db", db]), "initialized");
+    assert_eq!(
+        common::run(&dir, &["agent", "register", "alice", "--db", db]),
+        "alice developer"
+    );
+    assert_eq!(
+        common::run(&dir, &["--db", db, "agent", "list"]),
+        "alice developer"
+    );
+    assert_eq!(
+        common::run(&dir, &["agent", "--db", db, "list"]),
+        "alice developer"
+    );
+}
+
+#[test]
+fn db_flag_without_a_value_is_a_usage_error() {
+    let dir = common::project();
+
+    let err = common::usage_error(&dir, &["list", "--db"]);
+
+    assert_eq!(
+        err,
+        "error: a value is required for '--db <PATH>' but none was supplied"
+    );
+}
+
+/// If the parent directory of `--db` cannot be created, `init` must report the
+/// OS error instead of succeeding or panicking. Unix-only (relies on chmod).
 #[test]
 #[cfg(unix)]
-fn db_flag_init_propagates_parent_dir_creation_failure() {
+fn init_reports_a_parent_directory_that_cannot_be_created() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = TempDir::new().unwrap();
+    let dir = common::project();
     let readonly_parent = dir.path().join("readonly");
     std::fs::create_dir(&readonly_parent).unwrap();
     std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let db_path = readonly_parent.join("nested").join("board.db");
-    let mut cmd = kanban();
-    cmd.args(["--db", db_path.to_str().unwrap(), "init"]);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("Permission denied"));
+    let db = readonly_parent.join("nested").join("board.db");
+    let err = common::fail(&dir, &with_db(&db, &["init"]));
 
-    // Restore write permission so TempDir can clean itself up.
+    // Restore write permission so the TempDir can clean itself up.
     std::fs::set_permissions(&readonly_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(err.starts_with("error: "), "{err}");
+    assert!(err.contains("Permission denied"), "{err}");
 }
 
-/// `init`'s retry loop only retries errors whose message contains "database
-/// is locked" -- any other error (like a read-only *existing* target file,
-/// as opposed to an unwritable parent directory) must propagate immediately
-/// on the first attempt, not be silently swallowed by the retry logic.
-/// Deliberately not a lock-contention scenario: forcing genuine exhaustion
-/// of all 10 retries would require holding a lock for tens of seconds
-/// (each attempt gets its own 5-second `busy_timeout` budget before the outer
-/// retry loop even sees an error) -- confirmed by direct experimentation
-/// that a short held lock just makes `init` succeed once `busy_timeout`'s own
-/// retry absorbs the wait, rather than exhausting our loop. This test hits
-/// the same non-retriable-error code path via a fast, reliable, non-lock
-/// failure instead.
+/// `init` retries only "database is locked"; any other failure (here a
+/// read-only *existing* file) must surface on the first attempt. A lock is not
+/// used on purpose: exhausting the retries would need a lock held for tens of
+/// seconds, and a short one is simply absorbed by `busy_timeout`.
 #[test]
 #[cfg(unix)]
-fn db_flag_init_propagates_non_lock_errors_without_retrying() {
+fn init_reports_a_read_only_database_without_retrying() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("existing.db");
-    std::fs::File::create(&db_path).unwrap();
-    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let dir = common::project();
+    let db = dir.path().join("existing.db");
+    std::fs::File::create(&db).unwrap();
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o444)).unwrap();
 
-    let mut cmd = kanban();
-    cmd.args(["--db", db_path.to_str().unwrap(), "init"]);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains("readonly"));
+    let started = std::time::Instant::now();
+    let err = common::fail(&dir, &with_db(&db, &["init"]));
 
-    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-}
-
-/// `--db` and `--table`/`--pretty` are independent flags and compose fine
-/// together.
-#[test]
-fn db_flag_composes_with_pretty() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("board.db");
-
-    let mut init_cmd = kanban();
-    init_cmd.args(["--db", db_path.to_str().unwrap(), "init"]);
-    init_cmd.assert().success();
-
-    let mut cmd = kanban();
-    cmd.args([
-        "--pretty",
-        "--db",
-        db_path.to_str().unwrap(),
-        "agent",
-        "list",
-    ]);
-    let output = cmd.output().unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(err.contains("readonly"), "{err}");
     assert!(
-        stdout.contains('\n'),
-        "expected pretty multi-line output, got: {stdout:?}"
-    );
-}
-
-/// Global flags (`--db`, `--pretty`, `--table`) are declared with
-/// `global = true` specifically so they work in any position, not just
-/// before the subcommand -- README examples always show them first, but
-/// nothing previously locked in that `agent-kanban <subcommand> --db <path>`
-/// works identically to `agent-kanban --db <path> <subcommand>`. Worth
-/// covering explicitly after finding that a different "clap should just
-/// handle this" assumption (--version) was silently broken by how
-/// `#[command(...)]` was written.
-#[test]
-fn global_flags_work_after_the_subcommand_too() {
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("board.db");
-
-    // --db placed after the subcommand.
-    let mut init_cmd = kanban();
-    init_cmd.args(["init", "--db", db_path.to_str().unwrap()]);
-    init_cmd.assert().success();
-    assert!(db_path.is_file());
-
-    // --pretty placed after the subcommand and its own arguments.
-    let mut cmd = kanban();
-    cmd.args([
-        "agent",
-        "register",
-        "alice",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--pretty",
-    ]);
-    let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains('\n'),
-        "expected pretty multi-line output, got: {stdout:?}"
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "a non-lock error must not go through the retry/backoff loop"
     );
 }

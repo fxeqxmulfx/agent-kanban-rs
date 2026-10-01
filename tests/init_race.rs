@@ -1,82 +1,101 @@
-//! Real OS-process concurrency test for `agent-kanban init`. Unlike every other
-//! guarded operation in this codebase, `init`'s race isn't about a
-//! compare-and-swap guard -- it's about converting a brand-new database
-//! file to WAL mode for the first time, which needs a brief exclusive lock
-//! and (confirmed by direct reproduction) can surface "database is locked"
-//! even with `busy_timeout` set, in a way plain pragma ordering alone didn't
-//! fully close. `db::init()` mitigates this with a small idempotent retry
-//! loop (CREATE TABLE IF NOT EXISTS makes blind retry safe). This test
-//! proves two concurrent `init` calls in a fresh directory never surface
-//! that error to the caller, and that the resulting project is fully
-//! functional afterward, not just "didn't print an error."
+//! `init` racing itself. Converting a brand-new database file to WAL mode needs
+//! a brief exclusive lock and (confirmed by direct reproduction) can surface
+//! "database is locked" even with `busy_timeout` set; `db::init()` retries that
+//! one error because every statement it runs is idempotent. These tests prove
+//! that several `init` runs started at the same moment never leak that error,
+//! build the schema exactly once, and leave a board that really works.
 
-use assert_cmd::Command as AssertCommand;
-use std::process::{Command, Stdio};
-use tempfile::TempDir;
+mod common;
 
-const NUM_ROUNDS: usize = 25;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
 
-const fn kanban_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agent-kanban")
+const ROUNDS: usize = 20;
+const CONTENDERS: usize = 4;
+
+fn spawn_init(dir: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_agent-kanban"))
+        .arg("init")
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Wait for every contender and check that each one succeeded quietly.
+fn assert_all_initialized(children: Vec<Child>, round: usize) {
+    for (n, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "round {round}: init #{n} failed: stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(stdout, "initialized\n", "round {round}: init #{n}");
+        assert!(
+            !stderr.contains("locked"),
+            "round {round}: init #{n} surfaced lock contention: {stderr}"
+        );
+    }
 }
 
 #[test]
-fn concurrent_init_never_surfaces_database_locked() {
-    for round in 0..NUM_ROUNDS {
-        let dir = TempDir::new().unwrap();
+fn concurrent_init_in_a_fresh_directory_succeeds_everywhere_and_builds_the_schema_once() {
+    for round in 0..ROUNDS {
+        let dir = common::project();
+        let children = (0..CONTENDERS).map(|_| spawn_init(dir.path())).collect();
+        assert_all_initialized(children, round);
 
-        let child_a = Command::new(kanban_bin())
-            .arg("init")
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let conn = common::db(&dir);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        let child_b = Command::new(kanban_bin())
-            .arg("init")
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        assert_eq!(version, 3, "round {round}");
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                "acceptance_results",
+                "agents",
+                "review_history",
+                "task_deps",
+                "tasks"
+            ],
+            "round {round}"
+        );
 
-        let out_a = child_a.wait_with_output().unwrap();
-        let out_b = child_b.wait_with_output().unwrap();
-
-        for (label, out) in [("a", &out_a), ("b", &out_b)] {
-            assert!(
-                out.status.success(),
-                "round {round}: init {label} failed: stdout={} stderr={}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr),
-            );
-            assert!(
-                !String::from_utf8_lossy(&out.stderr).contains("locked"),
-                "round {round}: init {label} surfaced lock contention: {}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
-
-        // Not just "no error" -- the resulting project must actually work.
-        let mut register = AssertCommand::cargo_bin("agent-kanban").unwrap();
-        register
-            .current_dir(&dir)
-            .args(["agent", "register", "alice"])
-            .assert()
-            .success();
-
-        let mut add = AssertCommand::cargo_bin("agent-kanban").unwrap();
-        add.current_dir(&dir)
-            .args([
-                "add",
-                "--title",
-                "t",
-                "--priority",
-                "low",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
-            ])
-            .assert()
-            .success();
+        // Not just "no error": the board must actually work afterwards.
+        common::register(&dir, "alice", "developer");
+        assert_eq!(common::add_task(&dir, "t", "low"), 1, "round {round}");
     }
+}
+
+#[test]
+fn concurrent_init_on_a_board_with_data_keeps_every_row() {
+    let dir = common::initialized();
+    common::register(&dir, "alice", "developer");
+    let first = common::add_task(&dir, "keep me", "high");
+    let second = common::add_task_after(&dir, "me too", &[first]);
+
+    for round in 0..ROUNDS {
+        let children = (0..CONTENDERS).map(|_| spawn_init(dir.path())).collect();
+        assert_all_initialized(children, round);
+    }
+
+    assert_eq!(
+        common::run(&dir, &["list"]),
+        format!("#{first} high todo keep me\n#{second} medium todo after:{first} me too")
+    );
+    assert_eq!(common::run(&dir, &["agent", "list"]), "alice developer");
 }

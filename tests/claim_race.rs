@@ -1,200 +1,213 @@
-//! Real OS-process concurrency test for `agent-kanban claim`. This is the test
-//! that matters most for a "multiple concurrent agents" tool: it spawns N
-//! separate `agent-kanban` subprocesses that all race to claim the same task at
-//! (as close to) the same wall-clock instant as possible, exercising
-//! `SQLite`'s actual cross-process WAL locking rather than in-process thread
-//! interleaving over a single shared connection.
-//!
-//! We run the race a number of times (fresh task each round, in a shared
-//! project dir) to make it likely that at least one round genuinely
-//! interleaves at the OS/SQLite level, even on a fast/idle machine.
+//! Real OS-process races for `claim`. This is the test that matters most for a
+//! tool built for concurrent agents: separate `agent-kanban` processes, released
+//! together, fight over the same task through `SQLite`'s cross-process WAL
+//! locking (not threads sharing one connection). Each race runs for many rounds
+//! on fresh tasks so that at least some rounds interleave at the OS level even
+//! on a fast, idle machine. Tests assert invariants (exactly one winner, a
+//! consistent final state), never *who* wins.
 
-use assert_cmd::Command as AssertCommand;
-use serde_json::Value;
-use std::process::{Child, Command, Stdio};
-use tempfile::TempDir;
+mod common;
 
-const NUM_AGENTS: usize = 8;
-const NUM_ROUNDS: usize = 20;
+use common::{Outcome, argv, race};
 
-const fn kanban_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agent-kanban")
+const CONTENDERS: usize = 8;
+const ROUNDS: usize = 20;
+
+fn agent_names(prefix: &str) -> Vec<String> {
+    (0..CONTENDERS).map(|i| format!("{prefix}-{i}")).collect()
 }
 
-fn run_json(dir: &TempDir, args: &[&str]) -> Value {
-    let mut cmd = AssertCommand::cargo_bin("agent-kanban").unwrap();
-    let output = cmd.current_dir(dir).args(args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "command {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+/// Index of the one command that succeeded; every other one must have been
+/// refused (exit 1) with `refusal` in the message.
+fn only_winner(names: &[String], outcomes: &[Outcome], refusal: &str, round: usize) -> usize {
+    let winners: Vec<usize> = (0..names.len()).filter(|&i| outcomes[i].ok()).collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "round {round}: expected exactly one winner, got {:?}",
+        winners.iter().map(|&i| &names[i]).collect::<Vec<_>>()
     );
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-#[test]
-fn claim_race_exactly_one_winner() {
-    let dir = TempDir::new().unwrap();
-
-    run_json(&dir, &["init"]);
-    let agent_names: Vec<String> = (0..NUM_AGENTS).map(|i| format!("agent-{i}")).collect();
-    for name in &agent_names {
-        run_json(&dir, &["agent", "register", name]);
-    }
-
-    for round in 0..NUM_ROUNDS {
-        let created = run_json(
-            &dir,
-            &[
-                "add",
-                "--title",
-                &format!("race task round {round}"),
-                "--priority",
-                "medium",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
-            ],
-        );
-        let task_id = created["id"].as_i64().unwrap();
-        let task_id_str = task_id.to_string();
-
-        // Build all child commands first, then spawn them all before waiting
-        // on any of them, so they actually race each other.
-        let mut children: Vec<(String, Child)> = Vec::with_capacity(NUM_AGENTS);
-        for name in &agent_names {
-            let child = Command::new(kanban_bin())
-                .args(["claim", &task_id_str, "--agent", name])
-                .current_dir(&dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to spawn agent-kanban claim subprocess");
-            children.push((name.clone(), child));
-        }
-
-        let mut winners: Vec<String> = Vec::new();
-        let mut losers: Vec<(String, String)> = Vec::new(); // (agent, stderr)
-
-        for (name, child) in children {
-            let output = child.wait_with_output().unwrap();
-            if output.status.success() {
-                winners.push(name);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                losers.push((name, stderr));
-            }
-        }
-
-        assert_eq!(
-            winners.len(),
-            1,
-            "round {round}: expected exactly one winner, got {} winners ({winners:?}); \
-             this indicates that the atomic ownership guard admitted two developers",
-            winners.len()
-        );
-
-        for (name, stderr) in &losers {
+    for (name, outcome) in names.iter().zip(outcomes) {
+        if !outcome.ok() {
+            assert_eq!(outcome.code, Some(1), "round {round}: {name}: {outcome:?}");
             assert!(
-                stderr.contains("already claimed"),
-                "round {round}: loser agent {name} did not fail with 'already claimed': {stderr}"
+                outcome.stderr.contains(refusal),
+                "round {round}: {name} did not fail with '{refusal}': {}",
+                outcome.stderr
             );
         }
-        assert_eq!(
-            losers.len(),
-            NUM_AGENTS - 1,
-            "round {round}: expected {} losers, got {}",
-            NUM_AGENTS - 1,
-            losers.len()
-        );
+    }
+    winners[0]
+}
 
-        // A normal follow-up call: `show` must agree with exactly the
-        // winning agent and reflect the in_progress transition.
-        let shown = run_json(&dir, &["show", &task_id_str]);
-        assert_eq!(
-            shown["executor"].as_str().unwrap(),
-            winners[0],
-            "round {round}: show's executor does not match the process that won the race"
-        );
-        assert_eq!(shown["status"], "in_progress");
+#[test]
+fn exactly_one_developer_wins_a_contested_task() {
+    let dir = common::initialized();
+    let names = agent_names("dev");
+    for name in &names {
+        common::register(&dir, name, "developer");
+    }
+
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("race task round {round}"), "medium");
+        let id_arg = id.to_string();
+        let commands: Vec<_> = names
+            .iter()
+            .map(|name| argv(&["claim", &id_arg, "--agent", name]))
+            .collect();
+
+        let outcomes = race(&dir, &commands);
+
+        let winner = only_winner(&names, &outcomes, "already claimed", round);
+        // The winner is handed the work order for exactly this task...
+        let order = common::parse_order(&outcomes[winner].stdout);
+        assert_eq!(order["id"], id, "round {round}");
+        // ...and the board agrees with the process that won.
+        let shown = common::task(&dir, &["show", &id_arg]);
+        assert_eq!(shown["executor"], names[winner].as_str(), "round {round}");
+        assert_eq!(shown["status"], "in_progress", "round {round}");
     }
 }
 
 #[test]
-fn review_claim_race_exactly_one_reviewer_wins() {
-    let dir = TempDir::new().unwrap();
-    run_json(&dir, &["init"]);
-    run_json(
-        &dir,
-        &["agent", "register", "developer", "--role", "developer"],
-    );
-    let reviewer_names: Vec<String> = (0..NUM_AGENTS).map(|i| format!("reviewer-{i}")).collect();
-    for name in &reviewer_names {
-        run_json(&dir, &["agent", "register", name, "--role", "reviewer"]);
+fn exactly_one_reviewer_wins_a_task_in_review() {
+    let dir = common::initialized();
+    common::register(&dir, "dev", "developer");
+    let names = agent_names("rev");
+    for name in &names {
+        common::register(&dir, name, "reviewer");
     }
 
-    for round in 0..NUM_ROUNDS {
-        let created = run_json(
-            &dir,
-            &[
-                "add",
-                "--title",
-                &format!("review race task round {round}"),
-                "--priority",
-                "medium",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
-            ],
-        );
-        let task_id = created["id"].as_i64().unwrap().to_string();
-        run_json(&dir, &["claim", &task_id, "--agent", "developer"]);
-        run_json(
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("review race round {round}"), "medium");
+        let id_arg = id.to_string();
+        common::run(&dir, &["claim", &id_arg, "--agent", "dev"]);
+        common::run(
             &dir,
             &[
                 "submit-review",
-                &task_id,
+                &id_arg,
                 "--agent",
-                "developer",
-                "--result",
-                r#"{"criterion":0,"status":"passed","evidence":"verified"}"#,
+                "dev",
+                "--pass",
+                "0",
+                "verified",
             ],
         );
+        let commands: Vec<_> = names
+            .iter()
+            .map(|name| argv(&["claim", &id_arg, "--agent", name]))
+            .collect();
 
-        let mut children: Vec<(String, Child)> = Vec::with_capacity(NUM_AGENTS);
-        for name in &reviewer_names {
-            let child = Command::new(kanban_bin())
-                .args(["claim-review", &task_id, "--agent", name])
-                .current_dir(&dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to spawn claim-review subprocess");
-            children.push((name.clone(), child));
+        let outcomes = race(&dir, &commands);
+
+        let winner = only_winner(&names, &outcomes, "already claimed", round);
+        // The reviewer's packet carries the developer's verdicts.
+        let packet = common::parse_order(&outcomes[winner].stdout);
+        assert_eq!(packet["rev"], 1, "round {round}");
+        assert_eq!(packet["tests"][0]["result"], "passed", "round {round}");
+        assert_eq!(packet["tests"][0]["evidence"], "verified", "round {round}");
+        let shown = common::task(&dir, &["show", &id_arg]);
+        assert_eq!(shown["status"], "review", "round {round}");
+        assert_eq!(shown["executor"], names[winner].as_str(), "round {round}");
+    }
+}
+
+/// Claiming a task you already hold renews the lease, so the same agent racing
+/// itself (a retry that overlaps its first attempt) succeeds every time and
+/// still ends up as the single holder.
+#[test]
+fn the_same_agent_claiming_concurrently_always_succeeds() {
+    let dir = common::initialized();
+    common::register(&dir, "alice", "developer");
+
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("self race round {round}"), "medium");
+        let id_arg = id.to_string();
+        let commands = vec![argv(&["claim", &id_arg, "--agent", "alice"]); 6];
+
+        let outcomes = race(&dir, &commands);
+
+        for outcome in &outcomes {
+            assert!(outcome.ok(), "round {round}: {outcome:?}");
+            assert_eq!(outcome.stdout, outcomes[0].stdout, "round {round}");
         }
+        let shown = common::task(&dir, &["show", &id_arg]);
+        assert_eq!(shown["executor"], "alice", "round {round}");
+        assert_eq!(shown["status"], "in_progress", "round {round}");
+    }
+}
 
-        let mut winners = Vec::new();
-        for (name, child) in children {
-            let output = child.wait_with_output().unwrap();
-            if output.status.success() {
-                winners.push(name);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    stderr.contains("already claimed"),
-                    "round {round}: unexpected claim-review failure for {name}: {stderr}"
-                );
-            }
+#[test]
+fn developers_claiming_different_tasks_do_not_block_each_other() {
+    let dir = common::initialized();
+    let names = agent_names("dev");
+    for name in &names {
+        common::register(&dir, name, "developer");
+    }
+
+    for round in 0..ROUNDS / 2 {
+        let ids: Vec<String> = names
+            .iter()
+            .map(|name| common::add_task(&dir, &format!("{name} round {round}"), "low").to_string())
+            .collect();
+        let commands: Vec<_> = names
+            .iter()
+            .zip(&ids)
+            .map(|(name, id)| argv(&["claim", id, "--agent", name]))
+            .collect();
+
+        let outcomes = race(&dir, &commands);
+
+        for ((name, id), outcome) in names.iter().zip(&ids).zip(&outcomes) {
+            assert!(outcome.ok(), "round {round}: {name}: {outcome:?}");
+            let shown = common::task(&dir, &["show", id]);
+            assert_eq!(shown["executor"], name.as_str(), "round {round}");
         }
+    }
+}
 
-        assert_eq!(
-            winners.len(),
-            1,
-            "round {round}: expected exactly one review owner, got {winners:?}"
+/// `claim` against `move ... backlog` on the same unclaimed task. The two are
+/// mutually exclusive, so whichever commits first wins and the other is
+/// refused; the task must never end up both parked and claimed.
+#[test]
+fn claim_racing_a_move_to_backlog_leaves_a_consistent_task() {
+    let dir = common::initialized();
+    common::register(&dir, "dev", "developer");
+
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("move race round {round}"), "medium");
+        let id_arg = id.to_string();
+
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&["claim", &id_arg, "--agent", "dev"]),
+                argv(&["move", &id_arg, "backlog"]),
+            ],
         );
-        let shown = run_json(&dir, &["show", &task_id]);
-        assert_eq!(shown["status"], "review");
-        assert_eq!(shown["executor"], winners[0]);
-        assert_eq!(shown["executor_role"], "reviewer");
+        let (claim, parked) = (&outcomes[0], &outcomes[1]);
+
+        assert_ne!(claim.ok(), parked.ok(), "round {round}: {outcomes:?}");
+        let shown = common::task(&dir, &["show", &id_arg]);
+        if claim.ok() {
+            assert_eq!(shown["status"], "in_progress", "round {round}");
+            assert_eq!(shown["executor"], "dev", "round {round}");
+            assert_eq!(
+                parked.stderr,
+                format!(
+                    "error: task {id} is in_progress; move only works on backlog and todo tasks"
+                ),
+                "round {round}"
+            );
+        } else {
+            assert_eq!(shown["status"], "backlog", "round {round}");
+            assert!(shown.get("executor").is_none(), "round {round}: {shown}");
+            assert_eq!(
+                claim.stderr,
+                format!("error: task {id} is backlog; claim needs todo or in_progress"),
+                "round {round}"
+            );
+        }
     }
 }

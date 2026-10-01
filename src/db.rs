@@ -19,7 +19,7 @@ pub fn set_path_override(path: PathBuf) {
     let _ = PATH_OVERRIDE.set(path);
 }
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS agents (
@@ -76,10 +76,21 @@ CREATE TABLE IF NOT EXISTS acceptance_results (
   UNIQUE (task_id, revision, criterion_index)
 );
 
+-- `task_id` waits until `depends_on` is done. Deleting a task drops its own
+-- edges, but a task that others still wait on cannot be deleted.
+CREATE TABLE IF NOT EXISTS task_deps (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+  PRIMARY KEY (task_id, depends_on),
+  CHECK (task_id != depends_on)
+);
+
 CREATE INDEX IF NOT EXISTS review_history_task_revision
   ON review_history(task_id, revision);
 CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
   ON acceptance_results(task_id, revision, criterion_index);
+CREATE INDEX IF NOT EXISTS task_deps_depends_on
+  ON task_deps(depends_on);
 ";
 
 /// Walk up from cwd looking for `.kanban/board.db`, like git looks for `.git`.
@@ -139,7 +150,7 @@ pub fn open_existing() -> Result<Connection> {
 }
 
 fn check_schema_version(conn: &Connection) -> Result<()> {
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version = user_version(conn)?;
     if version > SCHEMA_VERSION {
         bail!(
             "this project's schema version ({version}) is newer than this build of \
@@ -213,15 +224,18 @@ fn try_init(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn user_version(conn: &Connection) -> Result<i32> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
 fn migrate_schema(conn: &mut Connection) -> Result<()> {
     check_schema_version(conn)?;
-    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == SCHEMA_VERSION {
+    if user_version(conn)? == SCHEMA_VERSION {
         return Ok(());
     }
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version = user_version(&tx)?;
     if version > SCHEMA_VERSION {
         bail!(
             "this project's schema version ({version}) is newer than this build of \
@@ -236,81 +250,62 @@ fn migrate_schema(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
-    if table_exists(&tx, "agents")? && !column_exists(&tx, "agents", "role")? {
+    // Each step runs only for boards older than the version that introduced
+    // it: the v1 data fix below resets every `review` task, which would wreck
+    // a live v2+ board if it ran again.
+    if version < 2 {
+        migrate_v1_to_v2(&tx)?;
+    }
+    // Every later table (review storage in v2, `task_deps` in v3) is created
+    // by the idempotent schema script.
+    tx.execute_batch(SCHEMA)?;
+    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// v1 had no roles, leases or revisions: add the columns, clear owners that
+/// make no sense in the new model, and give legacy claims a one-hour lease.
+fn migrate_v1_to_v2(tx: &Connection) -> Result<()> {
+    if !column_exists(tx, "agents", "role")? {
         tx.execute_batch(
             "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'developer'
              CHECK (role IN ('developer','reviewer'));",
         )?;
     }
-
-    if table_exists(&tx, "tasks")? {
-        if !column_exists(&tx, "tasks", "revision")? {
-            tx.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
-                 CHECK (revision >= 0);",
-            )?;
-        }
-        if !column_exists(&tx, "tasks", "claimed_at")? {
-            tx.execute_batch("ALTER TABLE tasks ADD COLUMN claimed_at TEXT;")?;
-        }
-        if !column_exists(&tx, "tasks", "lease_expires_at")? {
-            tx.execute_batch("ALTER TABLE tasks ADD COLUMN lease_expires_at TEXT;")?;
-        }
-
-        tx.execute(
-            "UPDATE tasks
-             SET status = CASE WHEN status = 'review' THEN 'in_progress' ELSE status END,
-                 executor = NULL,
-                 claimed_at = NULL,
-                 lease_expires_at = NULL
-             WHERE status = 'review'
-                OR (status != 'in_progress' AND executor IS NOT NULL)",
-            [],
-        )?;
-        tx.execute(
-            "UPDATE tasks
-             SET claimed_at = COALESCE(claimed_at, datetime('now')),
-                 lease_expires_at = COALESCE(
-                   lease_expires_at,
-                   datetime('now', '+3600 seconds')
-                 )
-             WHERE executor IS NOT NULL AND status = 'in_progress'",
-            [],
+    if !column_exists(tx, "tasks", "revision")? {
+        tx.execute_batch(
+            "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0
+             CHECK (revision >= 0);",
         )?;
     }
+    if !column_exists(tx, "tasks", "claimed_at")? {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN claimed_at TEXT;")?;
+    }
+    if !column_exists(tx, "tasks", "lease_expires_at")? {
+        tx.execute_batch("ALTER TABLE tasks ADD COLUMN lease_expires_at TEXT;")?;
+    }
 
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS review_history (
-           id INTEGER PRIMARY KEY,
-           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-           revision INTEGER NOT NULL CHECK (revision > 0),
-           decision TEXT NOT NULL CHECK (decision IN ('approved','changes_requested')),
-           notes TEXT NOT NULL DEFAULT '',
-           executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
-           executor_name TEXT NOT NULL,
-           created_at TEXT NOT NULL DEFAULT (datetime('now')),
-           UNIQUE (task_id, revision)
-         );
-         CREATE TABLE IF NOT EXISTS acceptance_results (
-           id INTEGER PRIMARY KEY,
-           task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-           revision INTEGER NOT NULL CHECK (revision > 0),
-           criterion_index INTEGER NOT NULL CHECK (criterion_index >= 0),
-           criterion TEXT NOT NULL CHECK (json_valid(criterion)),
-           result TEXT NOT NULL CHECK (result IN ('passed','failed')),
-           evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
-           executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
-           executor_name TEXT NOT NULL,
-           verified_at TEXT NOT NULL DEFAULT (datetime('now')),
-           UNIQUE (task_id, revision, criterion_index)
-         );
-         CREATE INDEX IF NOT EXISTS review_history_task_revision
-           ON review_history(task_id, revision);
-         CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
-           ON acceptance_results(task_id, revision, criterion_index);",
+    tx.execute(
+        "UPDATE tasks
+         SET status = CASE WHEN status = 'review' THEN 'in_progress' ELSE status END,
+             executor = NULL,
+             claimed_at = NULL,
+             lease_expires_at = NULL
+         WHERE status = 'review'
+            OR (status != 'in_progress' AND executor IS NOT NULL)",
+        [],
     )?;
-    tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
-    tx.commit()?;
+    tx.execute(
+        "UPDATE tasks
+         SET claimed_at = COALESCE(claimed_at, datetime('now')),
+             lease_expires_at = COALESCE(
+               lease_expires_at,
+               datetime('now', '+3600 seconds')
+             )
+         WHERE executor IS NOT NULL AND status = 'in_progress'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -449,5 +444,131 @@ mod tests {
         assert_eq!(status, "in_progress");
         assert!(table_exists(&conn, "review_history").unwrap());
         assert!(table_exists(&conn, "acceptance_results").unwrap());
+        assert!(table_exists(&conn, "task_deps").unwrap());
+    }
+
+    /// The schema exactly as version 2 shipped it (no `task_deps`).
+    const V2_SCHEMA: &str = r"
+        CREATE TABLE agents (
+          id INTEGER PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          role TEXT NOT NULL DEFAULT 'developer' CHECK (role IN ('developer','reviewer')),
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE tasks (
+          id INTEGER PRIMARY KEY,
+          title TEXT NOT NULL,
+          priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
+          status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
+          executor INTEGER REFERENCES agents(id),
+          tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
+          tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
+          revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+          claimed_at TEXT,
+          lease_expires_at TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          CHECK (
+            (executor IS NULL AND claimed_at IS NULL AND lease_expires_at IS NULL)
+            OR
+            (executor IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+          ),
+          CHECK (status != 'done' OR executor IS NULL)
+        );
+        CREATE TABLE review_history (
+          id INTEGER PRIMARY KEY,
+          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL CHECK (revision > 0),
+          decision TEXT NOT NULL CHECK (decision IN ('approved','changes_requested')),
+          notes TEXT NOT NULL DEFAULT '',
+          executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+          executor_name TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (task_id, revision)
+        );
+        CREATE TABLE acceptance_results (
+          id INTEGER PRIMARY KEY,
+          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          revision INTEGER NOT NULL CHECK (revision > 0),
+          criterion_index INTEGER NOT NULL CHECK (criterion_index >= 0),
+          criterion TEXT NOT NULL CHECK (json_valid(criterion)),
+          result TEXT NOT NULL CHECK (result IN ('passed','failed')),
+          evidence TEXT NOT NULL CHECK (length(trim(evidence)) > 0),
+          executor INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+          executor_name TEXT NOT NULL,
+          verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE (task_id, revision, criterion_index)
+        );
+        PRAGMA user_version = 2;";
+
+    /// Regression test for the v1 data fix (it resets every `review` task to
+    /// `in_progress`): that fix must run only for boards older than v2, so a
+    /// v2 board keeps its review state and its recorded results.
+    #[test]
+    fn version_two_migration_adds_task_deps_and_keeps_review_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(V2_SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, role) VALUES (1, 'dev', 'developer'), (2, 'rev', 'reviewer');
+             INSERT INTO tasks (id, title, priority, status, tests, revision)
+               VALUES (1, 'in review', 'high', 'review', '[{\"describe\":\"d\",\"input\":\"i\",\"output\":\"o\"}]', 1);
+             INSERT INTO acceptance_results
+               (task_id, revision, criterion_index, criterion, result, evidence, executor, executor_name)
+               VALUES (1, 1, 0, '{}', 'passed', 'cargo test', 1, 'dev');
+             INSERT INTO tasks (id, title, priority, status, tests, executor, claimed_at, lease_expires_at, revision)
+               VALUES (2, 'being reviewed', 'low', 'review', '[\"c\"]', 2,
+                       datetime('now'), datetime('now', '+1 hour'), 1);
+             INSERT INTO tasks (id, title, priority, status, tests)
+               VALUES (3, 'open', 'low', 'todo', '[\"c\"]');",
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "task_deps").unwrap());
+
+        migrate_schema(&mut conn).unwrap();
+        migrate_schema(&mut conn).unwrap();
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "task_deps").unwrap());
+
+        let status_of = |id: i64| -> (String, Option<i64>) {
+            conn.query_row(
+                "SELECT status, executor FROM tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(status_of(1), ("review".to_string(), None));
+        assert_eq!(status_of(2), ("review".to_string(), Some(2)));
+        assert_eq!(status_of(3), ("todo".to_string(), None));
+        let results: i64 = conn
+            .query_row("SELECT COUNT(*) FROM acceptance_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(results, 1);
+
+        // The new table is usable and enforces its constraints.
+        conn.execute(
+            "INSERT INTO task_deps (task_id, depends_on) VALUES (3, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO task_deps (task_id, depends_on) VALUES (3, 3)",
+                []
+            )
+            .is_err(),
+            "a task cannot depend on itself"
+        );
+        assert!(
+            conn.execute("DELETE FROM tasks WHERE id = 1", []).is_err(),
+            "a prerequisite cannot be deleted while a task still waits on it"
+        );
     }
 }

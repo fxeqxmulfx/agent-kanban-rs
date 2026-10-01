@@ -1,376 +1,392 @@
-//! Real OS-process concurrency tests for `remove`/`release`/`agent remove`
-//! racing against `claim` on the same task. `claim_race.rs` already proves
-//! the atomic compare-and-swap mechanism (`UPDATE ... WHERE <guard>`) is
-//! genuinely exclusive under real cross-process WAL contention for
-//! claim-vs-claim; `remove`/`edit`/`release` were fixed with the identical
-//! mechanism (see src/commands/task.rs and src/commands/lifecycle.rs), but
-//! until now that was only proven at the single-process SQL level, never
-//! empirically under real concurrent processes. These tests close that
-//! asymmetry for the operations with cleanly well-defined outcomes (remove
-//! and release are mutually exclusive with claim on the `executor` column,
-//! unlike edit, which doesn't touch it and can legitimately succeed
-//! alongside a concurrent claim). The `agent_remove_vs_claim` test below
-//! covers the original TOCTOU fix (claim's FK-violation catch) under real
-//! concurrency for the first time, and is what surfaced the separate
-//! "database is locked" transaction-behavior bug fixed alongside it.
+//! Real OS-process races between commands that change the same task or agent.
+//! `claim_race.rs` covers claim against claim; here `remove`, `edit`, `move`,
+//! `release`, `submit-review`, `approve`, `request-changes` and `agent remove`
+//! fight each other or `claim`. Every command is one transaction that checks and
+//! writes together, so each race has a small set of valid outcomes. Tests
+//! assert that the outcome is one of them and that the board agrees with what
+//! the processes reported, never which process wins. `common::race` also fails
+//! the test if any process leaks a raw `SQLite` error.
 
-use assert_cmd::Command as AssertCommand;
-use serde_json::Value;
-use std::process::{Command, Stdio};
-use tempfile::TempDir;
+mod common;
 
-const NUM_ROUNDS: usize = 20;
+use common::{Outcome, argv, race};
 
-const fn kanban_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_agent-kanban")
+const ROUNDS: usize = 20;
+
+fn not_found(id: i64) -> String {
+    format!("error: task {id} not found")
 }
 
-fn run_json(dir: &TempDir, args: &[&str]) -> Value {
-    let mut cmd = AssertCommand::cargo_bin("agent-kanban").unwrap();
-    let output = cmd.current_dir(dir).args(args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "command {:?} failed: stdout={} stderr={}",
-        args,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
+/// Task `id` claimed by `agent`; returns the id and its argument form.
+fn claimed_task(dir: &tempfile::TempDir, title: &str, agent: &str) -> (i64, String) {
+    let id = common::add_task(dir, title, "medium");
+    let id_arg = id.to_string();
+    common::run(dir, &["claim", &id_arg, "--agent", agent]);
+    (id, id_arg)
 }
 
-fn run_json_expect_failure(dir: &TempDir, args: &[&str]) -> Value {
-    let mut cmd = AssertCommand::cargo_bin("agent-kanban").unwrap();
-    let output = cmd.current_dir(dir).args(args).output().unwrap();
-    assert!(
-        !output.status.success(),
-        "command {args:?} unexpectedly succeeded"
-    );
-    serde_json::from_slice(&output.stderr).unwrap()
+fn pair(outcomes: &[Outcome]) -> (&Outcome, &Outcome) {
+    assert_eq!(outcomes.len(), 2);
+    (&outcomes[0], &outcomes[1])
 }
 
-/// Race `remove <id>` against `claim <id> --agent X` on a fresh unclaimed
-/// task. The two guarded statements are mutually exclusive on `executor`,
-/// so there are exactly two valid outcomes depending purely on which one's
-/// atomic statement commits first:
-///   (a) remove wins: task deleted, claim then fails "task {id} not found"
-///   (b) claim wins: task claimed, remove then fails "... is claimed ..."
-/// Anything else (both succeed, neither succeeds, or the final state
-/// doesn't match whichever process reported success) indicates the guard
-/// isn't actually atomic/exclusive.
+/// `remove` and `claim` exclude each other on an unclaimed task: either the
+/// task is deleted and the claim finds nothing, or it is claimed and the removal
+/// is refused.
 #[test]
-fn remove_vs_claim_race_never_corrupts_state() {
-    let dir = TempDir::new().unwrap();
-    run_json(&dir, &["init"]);
-    run_json(&dir, &["agent", "register", "agent-x"]);
+fn remove_racing_a_claim_never_corrupts_state() {
+    let dir = common::initialized();
+    common::register(&dir, "agent-x", "developer");
 
-    for round in 0..NUM_ROUNDS {
-        let created = run_json(
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("race task round {round}"), "medium");
+        let id_arg = id.to_string();
+
+        let outcomes = race(
             &dir,
             &[
-                "add",
-                "--title",
-                &format!("race task round {round}"),
-                "--priority",
-                "medium",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
+                argv(&["remove", &id_arg]),
+                argv(&["claim", &id_arg, "--agent", "agent-x"]),
             ],
         );
-        let id = created["id"].as_i64().unwrap();
-        let id_str = id.to_string();
+        let (remove, claim) = pair(&outcomes);
 
-        // Spawn both before waiting on either, so they actually race.
-        let remove_child = Command::new(kanban_bin())
-            .args(["remove", &id_str])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let claim_child = Command::new(kanban_bin())
-            .args(["claim", &id_str, "--agent", "agent-x"])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let remove_out = remove_child.wait_with_output().unwrap();
-        let claim_out = claim_child.wait_with_output().unwrap();
-
-        let remove_won = remove_out.status.success();
-        let claim_won = claim_out.status.success();
-
-        assert_ne!(
-            remove_won,
-            claim_won,
-            "round {round}: exactly one of remove/claim must win, got remove_won={remove_won} \
-             claim_won={claim_won} (remove stdout/stderr: {}/{}, claim stdout/stderr: {}/{})",
-            String::from_utf8_lossy(&remove_out.stdout),
-            String::from_utf8_lossy(&remove_out.stderr),
-            String::from_utf8_lossy(&claim_out.stdout),
-            String::from_utf8_lossy(&claim_out.stderr),
-        );
-
-        if remove_won {
-            let claim_stderr = String::from_utf8_lossy(&claim_out.stderr);
-            assert!(
-                claim_stderr.contains("not found"),
-                "round {round}: remove won but claim's failure wasn't 'not found': {claim_stderr}"
-            );
-            let err = run_json_expect_failure(&dir, &["show", &id_str]);
-            assert!(err["error"].as_str().unwrap().contains("not found"));
+        assert_ne!(remove.ok(), claim.ok(), "round {round}: {outcomes:?}");
+        if remove.ok() {
+            assert_eq!(remove.stdout, format!("#{id} removed"));
+            assert_eq!(claim.stderr, not_found(id), "round {round}");
+            assert_eq!(common::fail(&dir, &["show", &id_arg]), not_found(id));
         } else {
-            let remove_stderr = String::from_utf8_lossy(&remove_out.stderr);
-            assert!(
-                remove_stderr.contains("claimed"),
-                "round {round}: claim won but remove's failure wasn't 'claimed': {remove_stderr}"
+            assert_eq!(
+                remove.stderr,
+                format!("error: task {id} is claimed; release it before removing"),
+                "round {round}"
             );
-            let shown = run_json(&dir, &["show", &id_str]);
-            assert_eq!(shown["executor"], "agent-x");
-            assert_eq!(shown["status"], "in_progress");
+            let shown = common::task(&dir, &["show", &id_arg]);
+            assert_eq!(shown["executor"], "agent-x", "round {round}");
+            assert_eq!(shown["status"], "in_progress", "round {round}");
         }
     }
 }
 
-/// Race `release <id>` against `claim <id> --agent B` on a task already
-/// claimed by agent A. The release names agent A and therefore always
-/// succeeds here; the only question is timing relative to claim:
-///   (a) release commits first: executor -> NULL, then claim sees NULL and
-///       succeeds too (agent B now holds it, status `in_progress`).
-///   (b) claim's statement runs while A still holds it: claim fails
-///       "already claimed"; release still succeeds, clearing executor.
-/// Both are valid, well-defined outcomes; anything else is corruption.
+/// `release` by the holder always succeeds. A claim by someone else either runs
+/// first (refused: still held) or after the release (succeeds).
 #[test]
-fn release_vs_claim_race_never_corrupts_state() {
-    let dir = TempDir::new().unwrap();
-    run_json(&dir, &["init"]);
-    run_json(&dir, &["agent", "register", "agent-a"]);
-    run_json(&dir, &["agent", "register", "agent-b"]);
+fn release_racing_a_claim_never_corrupts_state() {
+    let dir = common::initialized();
+    common::register(&dir, "agent-a", "developer");
+    common::register(&dir, "agent-b", "developer");
 
-    for round in 0..NUM_ROUNDS {
-        let created = run_json(
+    for round in 0..ROUNDS {
+        let (id, id_arg) = claimed_task(&dir, &format!("race task round {round}"), "agent-a");
+
+        let outcomes = race(
             &dir,
             &[
-                "add",
-                "--title",
-                &format!("race task round {round}"),
-                "--priority",
-                "medium",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
+                argv(&["release", &id_arg, "--agent", "agent-a"]),
+                argv(&["claim", &id_arg, "--agent", "agent-b"]),
             ],
         );
-        let id = created["id"].as_i64().unwrap();
-        let id_str = id.to_string();
-        run_json(&dir, &["claim", &id_str, "--agent", "agent-a"]);
+        let (release, claim) = pair(&outcomes);
 
-        let release_child = Command::new(kanban_bin())
-            .args(["release", &id_str, "--agent", "agent-a"])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let claim_child = Command::new(kanban_bin())
-            .args(["claim", &id_str, "--agent", "agent-b"])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let release_out = release_child.wait_with_output().unwrap();
-        let claim_out = claim_child.wait_with_output().unwrap();
-
-        assert!(
-            release_out.status.success(),
-            "round {round}: release must always succeed here (task started claimed by \
-             agent-a); stdout/stderr: {}/{}",
-            String::from_utf8_lossy(&release_out.stdout),
-            String::from_utf8_lossy(&release_out.stderr),
-        );
-
-        let shown = run_json(&dir, &["show", &id_str]);
-        if claim_out.status.success() {
-            // Outcome (a): release cleared it, claim then took it.
-            assert_eq!(shown["executor"], "agent-b");
+        assert!(release.ok(), "round {round}: {outcomes:?}");
+        assert_eq!(release.stdout, format!("#{id} in_progress"));
+        let shown = common::task(&dir, &["show", &id_arg]);
+        if claim.ok() {
+            assert_eq!(shown["executor"], "agent-b", "round {round}");
         } else {
-            // Outcome (b): claim ran while agent-a still held it.
-            let claim_stderr = String::from_utf8_lossy(&claim_out.stderr);
             assert!(
-                claim_stderr.contains("already claimed"),
-                "round {round}: claim's failure wasn't 'already claimed': {claim_stderr}"
+                claim.stderr.starts_with(&format!(
+                    "error: task {id} is already claimed by 'agent-a' until "
+                )),
+                "round {round}: {}",
+                claim.stderr
             );
-            // release still went on to clear it independently.
-            assert_eq!(shown["executor"], Value::Null);
+            assert!(shown.get("executor").is_none(), "round {round}: {shown}");
         }
-        assert_eq!(shown["status"], "in_progress");
+        assert_eq!(shown["status"], "in_progress", "round {round}");
     }
 }
 
-/// Race `agent remove <name>` against `claim <id> --agent <name>` for the
-/// SAME agent -- the original TOCTOU this whole review thread started from
-/// (see src/commands/lifecycle.rs's `claim_with_agent_id`), which until now
-/// only had a deterministic single-process simulation, never a real
-/// multi-process proof. Investigating that exact gap surfaced a second,
-/// unrelated bug: `agent::remove`'s transaction used the default `Deferred`
-/// behavior, which caused spurious "database is locked" errors under
-/// completely ordinary concurrency (confirmed: ~83% failure rate in a
-/// manual repro) despite `busy_timeout` being set, because a deferred
-/// transaction upgrading a read snapshot to a writer mid-transaction can hit
-/// `SQLITE_BUSY` in a way `busy_timeout`'s retry loop doesn't cover. Fixed by
-/// switching to `TransactionBehavior::Immediate`.
-///
-/// This test guards both: `agent remove` must never surface "database is
-/// locked" under this race, and `claim` must never leak a raw
-/// "FOREIGN KEY constraint failed" (it must always fail cleanly with "is not
-/// registered" if it loses the race after the agent is already gone). It
-/// also verifies directly against the raw DB (bypassing the `LEFT JOIN` in
-/// `show`, which would silently render a dangling reference as `null`
-/// instead of surfacing it) that no task is ever left pointing at a deleted
-/// agent.
+/// `agent remove` against a `claim` by the very agent being removed. `agent
+/// remove` always succeeds, and it releases the task if and only if the claim
+/// got in first; a claim that loses fails cleanly with "not registered" and
+/// never with a raw foreign-key error. No task may be left pointing at a deleted
+/// agent, checked on the raw database because `show` would render a dangling id
+/// as nothing.
 #[test]
-fn agent_remove_vs_claim_race_never_locks_or_leaks_fk() {
-    let dir = TempDir::new().unwrap();
-    run_json(&dir, &["init"]);
+fn agent_remove_racing_a_claim_never_leaves_a_dangling_owner() {
+    let dir = common::initialized();
 
-    for round in 0..NUM_ROUNDS {
-        let agent_name = format!("agent-{round}");
-        run_json(&dir, &["agent", "register", &agent_name]);
-        let created = run_json(
+    for round in 0..ROUNDS {
+        let name = format!("agent-{round}");
+        common::register(&dir, &name, "developer");
+        let id = common::add_task(&dir, &format!("race task round {round}"), "medium");
+        let id_arg = id.to_string();
+
+        let outcomes = race(
             &dir,
             &[
-                "add",
-                "--title",
-                &format!("race task round {round}"),
-                "--priority",
-                "medium",
-                "--test",
-                r#"{"describe":"d","input":"i","output":"o"}"#,
+                argv(&["agent", "remove", &name]),
+                argv(&["claim", &id_arg, "--agent", &name]),
             ],
         );
-        let id = created["id"].as_i64().unwrap();
-        let id_str = id.to_string();
+        let (removed, claim) = pair(&outcomes);
 
-        let remove_child = Command::new(kanban_bin())
-            .args(["agent", "remove", &agent_name])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let claim_child = Command::new(kanban_bin())
-            .args(["claim", &id_str, "--agent", &agent_name])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let remove_out = remove_child.wait_with_output().unwrap();
-        let claim_out = claim_child.wait_with_output().unwrap();
-        let remove_stderr = String::from_utf8_lossy(&remove_out.stderr).to_string();
-        let claim_stderr = String::from_utf8_lossy(&claim_out.stderr).to_string();
-
-        // agent remove only ever races a single claim for the agent it's
-        // about to delete, and nothing else is concurrently modifying this
-        // agent's row, so it must always succeed -- in particular, it must
-        // never surface "database is locked".
-        assert!(
-            remove_out.status.success(),
-            "round {round}: agent remove must always succeed here; stderr={remove_stderr}"
-        );
-        assert!(
-            !remove_stderr.contains("database is locked"),
-            "round {round}: agent remove hit spurious lock contention: {remove_stderr}"
-        );
-
-        if !claim_out.status.success() {
+        assert!(removed.ok(), "round {round}: {outcomes:?}");
+        let shown = common::task(&dir, &["show", &id_arg]);
+        if claim.ok() {
+            assert_eq!(removed.stdout, format!("{name} removed, released #{id}"));
+            assert_eq!(shown["status"], "in_progress", "round {round}");
+        } else {
+            assert_eq!(removed.stdout, format!("{name} removed"));
             assert!(
-                !claim_stderr.contains("FOREIGN KEY"),
-                "round {round}: raw FK error leaked from claim: {claim_stderr}"
+                claim
+                    .stderr
+                    .starts_with(&format!("error: agent '{name}' is not registered")),
+                "round {round}: {}",
+                claim.stderr
             );
-            assert!(
-                claim_stderr.contains("not registered"),
-                "round {round}: unexpected claim failure: {claim_stderr}"
-            );
+            assert_eq!(shown["status"], "todo", "round {round}");
         }
+        assert!(shown.get("executor").is_none(), "round {round}: {shown}");
 
-        // Regardless of outcome, there must be no dangling executor
-        // reference. Checked against the raw DB, not `show`'s output --
-        // `show`'s LEFT JOIN would silently render a dangling id as `null`,
-        // masking exactly the bug this test exists to catch.
-        let db_path = dir.path().join(".kanban").join("board.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let dangling: i64 = conn
+        let dangling: i64 = common::db(&dir)
             .query_row(
-                "SELECT COUNT(*) FROM tasks LEFT JOIN agents ON tasks.executor = agents.id \
-                 WHERE tasks.id = ?1 AND tasks.executor IS NOT NULL AND agents.id IS NULL",
-                [id],
+                "SELECT COUNT(*) FROM tasks LEFT JOIN agents ON tasks.executor = agents.id
+                 WHERE tasks.executor IS NOT NULL AND agents.id IS NULL",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(
             dangling, 0,
-            "round {round}: task has a dangling executor reference to a deleted agent"
+            "round {round}: a task points at a deleted agent"
         );
     }
 }
 
-/// Race two `agent remove <same-name>` calls against each other. Both use
-/// the `Immediate`-transaction fix from `agent_remove_vs_claim`; this
-/// exercises that same fix under a different pairing (write-write
-/// contention on the same agent row, rather than agent-remove vs. claim).
-/// Exactly one must win (exit 0); the other must fail cleanly with
-/// "not found" (its DELETE affects 0 rows since the winner already removed
-/// it) -- never both winning, never a spurious "database is locked".
+/// Two removals of the same agent: exactly one wins, the other is told the agent
+/// is gone.
 #[test]
-fn double_agent_remove_race_has_exactly_one_winner() {
-    let dir = TempDir::new().unwrap();
-    run_json(&dir, &["init"]);
+fn removing_the_same_agent_twice_at_once_has_exactly_one_winner() {
+    let dir = common::initialized();
 
-    for round in 0..NUM_ROUNDS {
+    for round in 0..ROUNDS {
         let name = format!("agent-{round}");
-        run_json(&dir, &["agent", "register", &name]);
+        common::register(&dir, &name, "developer");
 
-        let child_a = Command::new(kanban_bin())
-            .args(["agent", "remove", &name])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let child_b = Command::new(kanban_bin())
-            .args(["agent", "remove", &name])
-            .current_dir(&dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let out_a = child_a.wait_with_output().unwrap();
-        let out_b = child_b.wait_with_output().unwrap();
-        let a_won = out_a.status.success();
-        let b_won = out_b.status.success();
-
-        assert_ne!(
-            a_won, b_won,
-            "round {round}: exactly one of the two agent-remove calls must win"
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&["agent", "remove", &name]),
+                argv(&["agent", "remove", &name]),
+            ],
         );
+        let (first, second) = pair(&outcomes);
 
-        let loser_stderr = if a_won {
-            String::from_utf8_lossy(&out_b.stderr).to_string()
+        assert_ne!(first.ok(), second.ok(), "round {round}: {outcomes:?}");
+        let (winner, loser) = if first.ok() {
+            (first, second)
         } else {
-            String::from_utf8_lossy(&out_a.stderr).to_string()
+            (second, first)
         };
-        assert!(
-            !loser_stderr.contains("locked"),
-            "round {round}: loser hit lock contention instead of a clean error: {loser_stderr}"
+        assert_eq!(winner.stdout, format!("{name} removed"), "round {round}");
+        assert_eq!(
+            loser.stderr,
+            format!("error: agent '{name}' not found"),
+            "round {round}"
         );
-        assert!(
-            loser_stderr.contains("not found"),
-            "round {round}: loser's failure wasn't 'not found': {loser_stderr}"
+    }
+}
+
+/// `edit` against `claim` of an unclaimed task: the claim always succeeds; the
+/// edit succeeds only if it landed first, and then the work order must already
+/// carry the new title. An edit that loses is refused whole.
+#[test]
+fn edit_racing_a_claim_never_half_applies() {
+    let dir = common::initialized();
+    common::register(&dir, "dev", "developer");
+
+    for round in 0..ROUNDS {
+        let title = format!("original round {round}");
+        let id = common::add_task(&dir, &title, "medium");
+        let id_arg = id.to_string();
+
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&["edit", &id_arg, "--title", "edited", "--priority", "urgent"]),
+                argv(&["claim", &id_arg, "--agent", "dev"]),
+            ],
         );
+        let (edit, claim) = pair(&outcomes);
+
+        assert!(claim.ok(), "round {round}: {outcomes:?}");
+        let order = common::parse_order(&claim.stdout);
+        let shown = common::task(&dir, &["show", &id_arg]);
+        if edit.ok() {
+            assert_eq!(edit.stdout, format!("#{id} todo"));
+            assert_eq!(order["title"], "edited", "round {round}");
+            assert_eq!(shown["title"], "edited", "round {round}");
+            assert_eq!(shown["priority"], "urgent", "round {round}");
+        } else {
+            assert_eq!(
+                edit.stderr,
+                format!("error: task {id} is claimed; release it before editing"),
+                "round {round}"
+            );
+            assert_eq!(order["title"], title.as_str(), "round {round}");
+            assert_eq!(shown["title"], title.as_str(), "round {round}");
+            assert_eq!(shown["priority"], "medium", "round {round}");
+        }
+    }
+}
+
+/// `remove` against `edit` of an unclaimed task: the removal always succeeds,
+/// and an edit that came second finds nothing.
+#[test]
+fn remove_racing_an_edit_leaves_no_task_behind() {
+    let dir = common::initialized();
+
+    for round in 0..ROUNDS {
+        let id = common::add_task(&dir, &format!("race task round {round}"), "medium");
+        let id_arg = id.to_string();
+
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&["remove", &id_arg]),
+                argv(&["edit", &id_arg, "--title", "edited"]),
+            ],
+        );
+        let (remove, edit) = pair(&outcomes);
+
+        assert!(remove.ok(), "round {round}: {outcomes:?}");
+        if !edit.ok() {
+            assert_eq!(edit.stderr, not_found(id), "round {round}");
+        }
+        assert_eq!(common::fail(&dir, &["show", &id_arg]), not_found(id));
+    }
+}
+
+/// The developer submits while also releasing the same task: exactly one gets
+/// through. A submit that wins stores its verdicts and moves the task to
+/// review; one that loses stores nothing.
+#[test]
+fn submit_review_racing_a_release_leaves_one_consistent_outcome() {
+    let dir = common::initialized();
+    common::register(&dir, "dev", "developer");
+
+    for round in 0..ROUNDS {
+        let (id, id_arg) = claimed_task(&dir, &format!("race task round {round}"), "dev");
+
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&[
+                    "submit-review",
+                    &id_arg,
+                    "--agent",
+                    "dev",
+                    "--pass",
+                    "0",
+                    "ok",
+                ]),
+                argv(&["release", &id_arg, "--agent", "dev"]),
+            ],
+        );
+        let (submit, release) = pair(&outcomes);
+
+        assert_ne!(submit.ok(), release.ok(), "round {round}: {outcomes:?}");
+        let shown = common::task(&dir, &["show", &id_arg]);
+        let stored: i64 = common::db(&dir)
+            .query_row(
+                "SELECT COUNT(*) FROM acceptance_results WHERE task_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let not_claimed = format!("error: task {id} is not claimed by 'dev'");
+        if submit.ok() {
+            assert_eq!(submit.stdout, format!("#{id} review rev1"));
+            assert_eq!(release.stderr, not_claimed, "round {round}");
+            assert_eq!(shown["status"], "review", "round {round}");
+            assert_eq!(shown["tests"][0]["result"], "passed", "round {round}");
+            assert_eq!(stored, 1, "round {round}");
+        } else {
+            assert_eq!(release.stdout, format!("#{id} in_progress"));
+            assert_eq!(submit.stderr, not_claimed, "round {round}");
+            assert_eq!(shown["status"], "in_progress", "round {round}");
+            assert!(shown.get("rev").is_none(), "round {round}: {shown}");
+            assert_eq!(stored, 0, "round {round}: a refused submit left results");
+        }
+    }
+}
+
+/// One reviewer both approves and requests changes at the same time: exactly one
+/// decision is recorded, and the loser is told the task is no longer in review.
+#[test]
+fn approve_racing_request_changes_records_exactly_one_decision() {
+    let dir = common::initialized();
+    common::register(&dir, "dev", "developer");
+    common::register(&dir, "rev", "reviewer");
+
+    for round in 0..ROUNDS {
+        let (id, id_arg) = claimed_task(&dir, &format!("race task round {round}"), "dev");
+        common::run(
+            &dir,
+            &[
+                "submit-review",
+                &id_arg,
+                "--agent",
+                "dev",
+                "--pass",
+                "0",
+                "ok",
+            ],
+        );
+        common::run(&dir, &["claim", &id_arg, "--agent", "rev"]);
+
+        let outcomes = race(
+            &dir,
+            &[
+                argv(&["approve", &id_arg, "--agent", "rev"]),
+                argv(&[
+                    "request-changes",
+                    &id_arg,
+                    "--agent",
+                    "rev",
+                    "--notes",
+                    "please fix",
+                ]),
+            ],
+        );
+        let (approve, changes) = pair(&outcomes);
+
+        assert_ne!(approve.ok(), changes.ok(), "round {round}: {outcomes:?}");
+        let shown = common::task(&dir, &["show", &id_arg, "--history"]);
+        let history = shown["history"].as_array().unwrap();
+        assert_eq!(history.len(), 1, "round {round}: {shown}");
+        if approve.ok() {
+            assert_eq!(approve.stdout, format!("#{id} done"));
+            assert_eq!(
+                changes.stderr,
+                format!("error: task {id} is done; request-changes needs review"),
+                "round {round}"
+            );
+            assert_eq!(shown["status"], "done", "round {round}");
+            assert_eq!(history[0]["decision"], "approved", "round {round}");
+        } else {
+            assert_eq!(changes.stdout, format!("#{id} in_progress"));
+            assert_eq!(
+                approve.stderr,
+                format!("error: task {id} is in_progress; approve needs review"),
+                "round {round}"
+            );
+            assert_eq!(shown["status"], "in_progress", "round {round}");
+            assert_eq!(shown["changes"], "please fix", "round {round}");
+            assert_eq!(history[0]["decision"], "changes_requested", "round {round}");
+        }
     }
 }
