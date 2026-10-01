@@ -366,7 +366,7 @@ fn list_limit_cuts_the_list_and_says_how_much_is_left() {
 
     assert_eq!(
         run(&dir, &["list", "--limit", "2"]),
-        "#1 urgent in_progress@alice t1\n#4 high todo t4\n+3 more (--limit)"
+        "#1 urgent in_progress@alice t1\n#4 high todo t4\n+3 more (--limit 0 = all)"
     );
     assert_eq!(
         run(&dir, &["list", "--limit", "5"]),
@@ -394,8 +394,91 @@ fn list_footers_count_hidden_done_and_cut_off_tasks_separately() {
 
     assert_eq!(
         run(&dir, &["list", "--limit", "1"]),
-        "#2 medium todo b\n+2 more (--limit)\n+1 done hidden (--all)"
+        "#2 medium todo b\n+2 more (--limit 0 = all)\n+1 done hidden (--all)"
     );
+}
+
+/// One careless `list` must not flood an agent's context: a big board answers
+/// with a bounded reply, and the footer says how to get the rest.
+#[test]
+fn list_prints_twenty_rows_by_default_and_says_how_to_see_the_rest() {
+    let dir = initialized();
+    for n in 1..=25 {
+        add_task(&dir, &format!("t{n}"), "medium");
+    }
+
+    let default = run(&dir, &["list"]);
+
+    let rows: Vec<&str> = default.lines().collect();
+    assert_eq!(rows.len(), 21, "{default}");
+    assert_eq!(rows[0], "#1 medium todo t1");
+    assert_eq!(rows[19], "#20 medium todo t20");
+    assert_eq!(rows[20], "+5 more (--limit 0 = all)");
+
+    // The footer's advice works: `--limit 0` is everything, with no footer.
+    let everything = run(&dir, &["list", "--limit", "0"]);
+    assert_eq!(everything.lines().count(), 25);
+    assert!(everything.starts_with(&format!("{}\n", rows[..20].join("\n"))));
+    assert!(everything.ends_with("#25 medium todo t25"), "{everything}");
+    // A limit is a plain number too: above the cap it shows more.
+    assert_eq!(run(&dir, &["list", "--limit", "25"]), everything);
+    assert_eq!(
+        run(&dir, &["list", "--limit", "24"]).lines().last(),
+        Some("+1 more (--limit 0 = all)")
+    );
+}
+
+/// The cap cuts, it does not sort: the most actionable rows stay.
+#[test]
+fn the_default_cap_keeps_the_most_urgent_rows() {
+    let dir = initialized();
+    for n in 1..=21 {
+        add_task(&dir, &format!("low{n}"), "low");
+    }
+    let urgent = add_task(&dir, "late but urgent", "urgent");
+
+    let rows: Vec<String> = run(&dir, &["list"]).lines().map(String::from).collect();
+
+    assert_eq!(rows.len(), 21);
+    assert_eq!(rows[0], format!("#{urgent} urgent todo late but urgent"));
+    assert_eq!(rows[1], "#1 low todo low1");
+    assert_eq!(rows[19], "#19 low todo low19");
+    // 22 tasks, 20 shown.
+    assert_eq!(rows[20], "+2 more (--limit 0 = all)");
+}
+
+#[test]
+fn exactly_twenty_tasks_fit_without_a_footer() {
+    let dir = initialized();
+    for n in 1..=20 {
+        add_task(&dir, &format!("t{n}"), "medium");
+    }
+
+    let out = run(&dir, &["list"]);
+
+    assert_eq!(out.lines().count(), 20);
+    assert!(!out.contains("more"), "{out}");
+}
+
+/// The default applies to every filtered view as well: each prints its first
+/// twenty matches, and counts only the matches it left out.
+#[test]
+fn the_default_cap_applies_to_filtered_lists_and_counts_only_matches() {
+    let dir = initialized();
+    for n in 1..=22 {
+        add_task(&dir, &format!("a{n}"), "high");
+    }
+    for n in 1..=5 {
+        add_task(&dir, &format!("b{n}"), "low");
+    }
+
+    let high = run(&dir, &["list", "--priority", "high"]);
+    let low = run(&dir, &["list", "--priority", "low"]);
+
+    assert_eq!(high.lines().count(), 21, "{high}");
+    assert_eq!(high.lines().last(), Some("+2 more (--limit 0 = all)"));
+    assert_eq!(low.lines().count(), 5, "{low}");
+    assert!(!low.contains("more"), "{low}");
 }
 
 #[test]

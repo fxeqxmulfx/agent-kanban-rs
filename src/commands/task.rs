@@ -84,6 +84,11 @@ fn add_inner(conn: &mut Connection, task: &NewTask) -> Result<String> {
     ))
 }
 
+/// Rows `list` prints when `--limit` is not given. A big board must not flood
+/// an agent's context because of one careless `list`: 300 tasks cost about
+/// 5,400 tokens, these rows about 370.
+pub const DEFAULT_LIST_LIMIT: usize = 20;
+
 pub struct ListFilter {
     pub status: Option<String>,
     pub tag: Option<String>,
@@ -99,7 +104,7 @@ pub struct ListFilter {
 /// `list` -> one line per task (see [`view::line`]), most actionable first:
 /// `in_progress`, review, todo, backlog, done; by priority, then id. Done
 /// tasks are hidden unless `--all` or `--status done`; footers say how many
-/// rows were left out.
+/// rows were left out, and how to see them.
 pub fn list(filter: &ListFilter) -> Result<String> {
     let conn = crate::db::open_existing()?;
     list_inner(&conn, filter)
@@ -191,7 +196,7 @@ fn list_inner(conn: &Connection, filter: &ListFilter) -> Result<String> {
         .collect();
     let shown = i64::try_from(lines.len())?;
     if total > shown {
-        lines.push(format!("+{} more (--limit)", total - shown));
+        lines.push(format!("+{} more (--limit 0 = all)", total - shown));
     }
     if hidden_done > 0 {
         lines.push(format!("+{hidden_done} done hidden (--all)"));
@@ -735,7 +740,7 @@ mod tests {
         filter.limit = 2;
         assert_eq!(
             list_inner(&conn, &filter).unwrap(),
-            "#1 low todo t0\n#2 low todo t1\n+3 more (--limit)"
+            "#1 low todo t0\n#2 low todo t1\n+3 more (--limit 0 = all)"
         );
         filter.limit = 5;
         assert_eq!(lines(&list_inner(&conn, &filter).unwrap()).len(), 5);

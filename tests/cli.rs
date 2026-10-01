@@ -91,6 +91,77 @@ fn the_guide_prints_the_embedded_text_and_needs_no_board() {
     assert_eq!(run(&dir, &["guide"]), GUIDE.trim_end());
 }
 
+/// An agent that needs only its own job asks for that part: far fewer tokens
+/// to read, and like the whole guide it needs no board.
+#[test]
+fn a_guide_part_prints_only_that_part_and_needs_no_board() {
+    let dir = project();
+    let whole = run(&dir, &["guide"]);
+    let headings = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.is_empty() && line.bytes().all(|b| b.is_ascii_uppercase()))
+            .map(String::from)
+            .collect()
+    };
+    let cases: [(&str, &[&str]); 4] = [
+        ("developer", &["WORK", "DEVELOPER"]),
+        ("reviewer", &["WORK", "REVIEWER"]),
+        ("planning", &["PLANNING"]),
+        ("board", &["BOARD"]),
+    ];
+
+    for (part, sections) in cases {
+        let text = run(&dir, &["guide", part]);
+
+        assert_eq!(headings(&text), sections, "{part}");
+        assert!(text.starts_with(whole.lines().next().unwrap()), "{part}");
+        assert!(text.ends_with(whole.lines().last().unwrap()), "{part}");
+        assert!(
+            text.len() * 100 <= whole.len() * 70,
+            "{part} is {} of {} bytes",
+            text.len(),
+            whole.len()
+        );
+        for line in text.lines() {
+            assert!(whole.lines().any(|w| w == line), "{part}: {line:?}");
+        }
+    }
+    assert_eq!(
+        headings(&whole),
+        ["WORK", "DEVELOPER", "REVIEWER", "PLANNING", "BOARD"]
+    );
+}
+
+/// A part that does not exist is a usage error that names the ones that do.
+#[test]
+fn an_unknown_guide_part_names_the_known_ones() {
+    let dir = project();
+
+    let message = usage_error(&dir, &["guide", "nosuch"]);
+
+    let mut lines = message.lines();
+    assert_eq!(
+        lines.next(),
+        Some("error: invalid value 'nosuch' for '[PART]'")
+    );
+    assert_eq!(
+        lines.next(),
+        Some("  [possible values: developer, reviewer, planning, board]")
+    );
+}
+
+/// `list` is capped by default, and the help screen says so.
+#[test]
+fn the_list_help_states_the_default_limit() {
+    let dir = project();
+
+    let help = run(&dir, &["list", "--help"]);
+
+    assert!(help.contains("--limit <N>"), "{help}");
+    assert!(help.contains("0 prints all of them"), "{help}");
+    assert!(help.contains("[default: 20]"), "{help}");
+}
+
 /// Every agent reads the guide at the start of every session, so its size is
 /// part of the design, not an accident.
 #[test]
@@ -321,6 +392,10 @@ fn bad_arguments_are_usage_errors_with_a_clear_first_line() {
         (
             vec!["list", "--limit", "x"],
             "error: invalid value 'x' for '--limit <N>': invalid digit found in string",
+        ),
+        (
+            vec!["guide", "nosuch"],
+            "error: invalid value 'nosuch' for '[PART]'",
         ),
         (
             vec!["claim", "1", "--lease", "x"],
@@ -580,6 +655,7 @@ fn every_reply_ends_with_exactly_one_newline() {
         &["status"],
         &["agent", "list"],
         &["guide"],
+        &["guide", "reviewer"],
         &["claim", "1", "--agent", "dev"],
         &["claim-next", "--agent", "dev"],
         &["release", "1", "--agent", "dev"],

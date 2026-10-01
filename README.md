@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 450 tokens).
+command (`agent-kanban guide`, about 450 tokens, or about 200 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -128,13 +128,13 @@ ever missing from it:
 ```text
 agent-kanban: task board for LLM agents. Replies are short text; errors go to stderr, exit 1.
 Say who you are with --agent NAME or env AGENT_KANBAN_AGENT. Ids are numbers (replies show #7).
-DEVELOPER
-  claim-next -> #7 [rev2] TITLE, changes|NOTES (rework only), then a line per test: IDX|DESCRIBE|INPUT|OUTPUT; or `idle` (`idle, N open`: tasks exist but are held, blocked or in review)
+WORK
+  claim-next -> #7 [rev2] TITLE, changes|NOTES (rework only), then a line per test: IDX|DESCRIBE|INPUT|OUTPUT (a reviewer's lines end |RESULT|EVIDENCE); or `idle` (`idle, N open`: tasks exist but are held, blocked or in review)
   claim ID: the same for one task. Claiming again renews the lease (--lease SECS, default 3600).
+DEVELOPER
   submit-review ID --pass IDX EVIDENCE | --fail IDX EVIDENCE   one per test -> #7 review rev1
   changes = the reviewer's notes from a rejection: fix, submit again. release ID gives a task back.
 REVIEWER
-  claim-next -> the same; each test line ends |RESULT|EVIDENCE
   approve ID [--notes T] -> #7 done [unblocked:IDS]     request-changes ID --notes T
 PLANNING
   add --title T [--priority low|medium|high|urgent] [--tag T]... --test DESC INPUT OUTPUT (1+) [--after IDS]
@@ -143,21 +143,34 @@ PLANNING
   --after IDS: tasks that must be done first (a DAG, cycles refused); developers cannot claim before that.
 BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
-  show ID [--history]   status   agent list|remove NAME   init   guide (this text)   --db PATH
+  show ID [--history]   status   agent list|remove NAME   init   guide [developer|reviewer|planning|board]   --db PATH
 In `|` lines \| \\ \n mean | \ and newline.
 ```
+
+An agent that does one job does not need the whole manual.
+`agent-kanban guide developer` (or `reviewer`, `planning`, `board`) prints just that part:
+the two opening lines and the closing escape rule, plus the sections of the job (`WORK` is
+shared by developers and reviewers). A part has no text of its own, only lines of the full
+manual in the same order, so it cannot drift from it. Measured (`o200k_base`):
+
+| `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
+|---|---|---|---|---|---|
+| tokens | 456 | 223 (−51%) | 199 (−56%) | 184 (−60%) | 156 (−66%) |
+
+Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
+230 tokens in every session of that agent.
 
 ## Command reference
 
 | Command | Reply | Behavior / restrictions |
 |---|---|---|
 | `init` | `initialized` | Creates `.kanban/board.db` in the current directory (or the file given by `--db`, making parent directories). Safe to repeat and to run concurrently. |
-| `guide` | the text above | The built-in manual. |
+| `guide [developer\|reviewer\|planning\|board]` | the text above, or one part of it | The built-in manual. Needs no board. |
 | `agent register NAME [--role developer\|reviewer]` | `NAME ROLE` | Registers a named agent. The default role is `developer`. Names must not contain whitespace. |
 | `agent list` | `NAME ROLE` per line, or `no agents` | |
 | `agent remove NAME` | `NAME removed` or `NAME removed, released #1,#2` | Releases the tasks the agent holds (their statuses are preserved) and deletes the agent in one transaction. Review and result history keep the agent's name. |
 | `add --title T [--priority P] [--tag X]... --test DESC INPUT OUTPUT [--test ...]... [--after IDS]` | `#7 todo` or `#7 todo after:3,5` | Creates a task in `todo`. Priority defaults to `medium`. At least one `--test` is required; each takes exactly three values. `--after` lists prerequisites (comma-separated or repeated). |
-| `list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N]` | one `#ID PRIORITY STATUS[@agent][ after:IDS] TITLE` line per task | Ordered `in_progress`, `review`, `todo`, `backlog`, `done`, then by priority, then id. Done tasks are hidden unless `--all` or `--status done`. `--executor` only matches a live (unexpired) claim. Footers: `+N more (--limit)`, `+N done hidden (--all)`; an empty board prints `no tasks`. |
+| `list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N]` | one `#ID PRIORITY STATUS[@agent][ after:IDS] TITLE` line per task | Ordered `in_progress`, `review`, `todo`, `backlog`, `done`, then by priority, then id. Done tasks are hidden unless `--all` or `--status done`. `--executor` only matches a live (unexpired) claim. Prints at most 20 rows unless `--limit N` says otherwise (`--limit 0` prints all), so one careless call cannot flood an agent's context. Footers: `+N more (--limit 0 = all)`, `+N done hidden (--all)`; an empty board prints `no tasks`. |
 | `show ID [--history]` | header line and `\|` rows ([format](#task-replies)) | Everything about one task; what is empty is left out. `--history` adds every past revision with its results and the review decision. |
 | `claim ID [--agent A] [--lease SECS]` | work order (header line and `\|` rows) | A **developer** takes a `todo`, or an unclaimed/expired `in_progress`, task whose prerequisites are all done; it becomes `in_progress`. A **reviewer** takes a task in `review`; it stays in `review`. Claiming again as the holder renews the lease (default 3600 s). |
 | `claim-next [--agent A] [--lease SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. |
@@ -330,8 +343,15 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 450 tokens) replaces reading the `--help` screens (about
-2,300 tokens in total).
+with one call, and `guide` (about 450 tokens; one job's part about 150–220) replaces
+reading the `--help` screens (about 2,300 tokens in total).
+
+The scenario's board is small. Output that grows with the board is the one cost nothing
+above bounds: `list` on 300 tasks prints 300 rows, about 5,400 tokens, more than the whole
+scenario. So `list` stops at 20 rows unless told otherwise: 20 rows and the footer
+`+280 more (--limit 0 = all)` cost about 370 tokens (−93%), and the board still answers
+every question through filters (`--status`, `--tag`, `--priority`, `--executor`) or
+`--limit 0`.
 
 ## Upgrading from 0.2
 
@@ -349,6 +369,7 @@ command line was simplified and **the old forms were removed, not deprecated**:
 | `claim-review ID` | `claim ID` as a reviewer, or `claim-next` |
 | `move ID --status S` | `move ID S` |
 | `list --sort ...` | `list` is always in working order |
+| `list` printing every task | `list` prints 20 rows; `--limit 0` prints all |
 | `transitions` | the lifecycle is described by `guide` |
 | timestamps, agent ids, duplicated specs and review history in replies | `show ID [--history]` |
 

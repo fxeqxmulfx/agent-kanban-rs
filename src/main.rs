@@ -7,8 +7,9 @@ use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+use commands::guide::Part;
 use commands::lifecycle::{self, DEFAULT_LEASE_SECONDS};
-use commands::task::{ListFilter, NewTask, TaskEdit};
+use commands::task::{DEFAULT_LIST_LIMIT, ListFilter, NewTask, TaskEdit};
 
 #[derive(Parser)]
 #[command(
@@ -57,8 +58,11 @@ enum Command {
     /// Create `.kanban/board.db` in the current directory
     Init,
 
-    /// Print the usage guide (read this first)
-    Guide,
+    /// Print the usage guide, or one part of it (read this first)
+    Guide {
+        /// Only the part for this job; default: the whole guide
+        part: Option<Part>,
+    },
 
     /// Register, list and remove agents
     Agent {
@@ -109,9 +113,9 @@ enum Command {
         /// Include done tasks
         #[arg(long)]
         all: bool,
-        /// Print at most N tasks
-        #[arg(long, value_name = "N")]
-        limit: Option<usize>,
+        /// Print at most N tasks; 0 prints all of them
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_LIST_LIMIT)]
+        limit: usize,
     },
 
     /// Show one task: a header line, then its tags, notes and tests
@@ -295,7 +299,7 @@ fn group(values: &[String], size: usize) -> Vec<Vec<String>> {
 fn run(command: Command) -> Result<String> {
     match command {
         Command::Init => commands::init(),
-        Command::Guide => Ok(commands::guide()),
+        Command::Guide { part } => Ok(commands::guide::text(part)),
         Command::Agent { action } => match action {
             AgentAction::Register { name, role } => commands::agent::register(&name, &role),
             AgentAction::List => commands::agent::list(),
@@ -327,7 +331,7 @@ fn run(command: Command) -> Result<String> {
             executor,
             priority,
             all,
-            limit: limit.unwrap_or(0),
+            limit,
         }),
         Command::Show { id, history } => commands::task::show(id, history),
         Command::Edit {
