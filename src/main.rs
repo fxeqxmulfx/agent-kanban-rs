@@ -64,6 +64,13 @@ enum Command {
         part: Option<Part>,
     },
 
+    /// Print the guide as a Claude Code skill (SKILL.md); save it as
+    /// .claude/skills/<its name>/SKILL.md
+    Skill {
+        /// Only the part for this job; default: the whole guide
+        part: Option<Part>,
+    },
+
     /// Register, list and remove agents
     Agent {
         #[command(subcommand)]
@@ -300,6 +307,7 @@ fn run(command: Command) -> Result<String> {
     match command {
         Command::Init => commands::init(),
         Command::Guide { part } => Ok(commands::guide::text(part)),
+        Command::Skill { part } => Ok(commands::skill::text(part)),
         Command::Agent { action } => match action {
             AgentAction::Register { name, role } => commands::agent::register(&name, &role),
             AgentAction::List => commands::agent::list(),

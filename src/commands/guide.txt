@@ -15,5 +15,5 @@ PLANNING
   --after IDS: tasks that must be done first (a DAG, cycles refused); developers cannot claim before that.
 BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
-  show ID [--history]   status   agent list|remove NAME   init   guide [developer|reviewer|planning|board]   --db PATH
+  show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
 In `|` lines \| \\ \n mean | \ and newline.

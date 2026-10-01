@@ -150,6 +150,65 @@ fn an_unknown_guide_part_names_the_known_ones() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The skill file
+// ---------------------------------------------------------------------------
+
+/// The skill is the guide behind a frontmatter, so it cannot disagree with the
+/// guide, and like the guide it needs no board.
+#[test]
+fn skill_prints_a_skill_file_whose_body_is_the_guide_and_needs_no_board() {
+    let dir = project();
+
+    let file = run(&dir, &["skill"]);
+
+    let (front, body) = file.split_once("\n---\n\n").unwrap();
+    assert!(
+        front.starts_with("---\nname: agent-kanban\ndescription: "),
+        "{front}"
+    );
+    assert_eq!(
+        front.lines().count(),
+        3,
+        "fence, name, description: {front}"
+    );
+    assert_eq!(body, GUIDE.trim_end());
+}
+
+/// A part's skill is named after the part and carries only that part.
+#[test]
+fn a_skill_part_is_named_after_the_part_and_carries_only_that_part() {
+    let dir = project();
+
+    for part in ["developer", "reviewer", "planning", "board"] {
+        let file = run(&dir, &["skill", part]);
+
+        let (front, body) = file.split_once("\n---\n\n").unwrap();
+        assert!(
+            front.starts_with(&format!("---\nname: agent-kanban-{part}\ndescription: ")),
+            "{part}: {front}"
+        );
+        assert_eq!(body, run(&dir, &["guide", part]), "{part}");
+    }
+}
+
+#[test]
+fn an_unknown_skill_part_names_the_known_ones() {
+    let dir = project();
+
+    let message = usage_error(&dir, &["skill", "nosuch"]);
+
+    let mut lines = message.lines();
+    assert_eq!(
+        lines.next(),
+        Some("error: invalid value 'nosuch' for '[PART]'")
+    );
+    assert_eq!(
+        lines.next(),
+        Some("  [possible values: developer, reviewer, planning, board]")
+    );
+}
+
 /// `list` is capped by default, and the help screen says so.
 #[test]
 fn the_list_help_states_the_default_limit() {
@@ -395,6 +454,10 @@ fn bad_arguments_are_usage_errors_with_a_clear_first_line() {
         ),
         (
             vec!["guide", "nosuch"],
+            "error: invalid value 'nosuch' for '[PART]'",
+        ),
+        (
+            vec!["skill", "nosuch"],
             "error: invalid value 'nosuch' for '[PART]'",
         ),
         (
@@ -656,6 +719,8 @@ fn every_reply_ends_with_exactly_one_newline() {
         &["agent", "list"],
         &["guide"],
         &["guide", "reviewer"],
+        &["skill"],
+        &["skill", "board"],
         &["claim", "1", "--agent", "dev"],
         &["claim-next", "--agent", "dev"],
         &["release", "1", "--agent", "dev"],

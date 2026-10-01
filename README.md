@@ -143,7 +143,7 @@ PLANNING
   --after IDS: tasks that must be done first (a DAG, cycles refused); developers cannot claim before that.
 BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
-  show ID [--history]   status   agent list|remove NAME   init   guide [developer|reviewer|planning|board]   --db PATH
+  show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
 In `|` lines \| \\ \n mean | \ and newline.
 ```
 
@@ -155,10 +155,38 @@ manual in the same order, so it cannot drift from it. Measured (`o200k_base`):
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 456 | 223 (−51%) | 199 (−56%) | 184 (−60%) | 156 (−66%) |
+| tokens | 458 | 223 (−51%) | 199 (−57%) | 184 (−60%) | 158 (−66%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
 230 tokens in every session of that agent.
+
+## As a Claude Code skill
+
+[Claude Code](https://claude.com/claude-code) keeps a *skill* out of the way until a task
+calls for it: only the `name` and `description` in the frontmatter of its `SKILL.md` are in
+every session, and the body is read once the skill is used. `agent-kanban skill` prints the
+guide in that shape, so an agent learns the board without anyone pasting the manual into its
+prompt:
+
+```sh
+# for you, in every project
+mkdir -p ~/.claude/skills/agent-kanban
+agent-kanban skill > ~/.claude/skills/agent-kanban/SKILL.md
+
+# or only the part one job needs, for one project (the skill is then named agent-kanban-reviewer)
+mkdir -p .claude/skills/agent-kanban-reviewer
+agent-kanban skill reviewer > .claude/skills/agent-kanban-reviewer/SKILL.md
+```
+
+The directory is named after the skill: `agent-kanban`, or `agent-kanban-developer`,
+`-reviewer`, `-planning`, `-board` for a part. Install the whole skill *or* the parts you
+need, not both, since they describe the same commands. The body is exactly what `guide` (or
+`guide reviewer`, ...) prints, so the two cannot disagree; the file is a copy, so save it
+again after upgrading `agent-kanban`.
+
+What it costs (`o200k_base`): the description that is in every session is 39 to 61 tokens
+depending on the skill, and the body, which is read only when the skill is used, is the
+guide's 158 to 458.
 
 ## Command reference
 
@@ -166,6 +194,7 @@ Whoever starts an agent can put `agent-kanban guide developer` in its prompt and
 |---|---|---|
 | `init` | `initialized` | Creates `.kanban/board.db` in the current directory (or the file given by `--db`, making parent directories). Safe to repeat and to run concurrently. |
 | `guide [developer\|reviewer\|planning\|board]` | the text above, or one part of it | The built-in manual. Needs no board. |
+| `skill [developer\|reviewer\|planning\|board]` | a `SKILL.md`: frontmatter, then the text `guide` prints | The guide as a [Claude Code skill](#as-a-claude-code-skill). Needs no board. |
 | `agent register NAME [--role developer\|reviewer]` | `NAME ROLE` | Registers a named agent. The default role is `developer`. Names must not contain whitespace. |
 | `agent list` | `NAME ROLE` per line, or `no agents` | |
 | `agent remove NAME` | `NAME removed` or `NAME removed, released #1,#2` | Releases the tasks the agent holds (their statuses are preserved) and deletes the agent in one transaction. Review and result history keep the agent's name. |

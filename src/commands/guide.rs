@@ -212,6 +212,7 @@ mod tests {
                     "add --title",
                     "list [",
                     "agent register",
+                    "skill",
                 ],
             ),
             (
@@ -223,7 +224,13 @@ mod tests {
                     "approve",
                     "request-changes",
                 ],
-                &["submit-review", "release ID", "add --title", "list ["],
+                &[
+                    "submit-review",
+                    "release ID",
+                    "add --title",
+                    "list [",
+                    "skill",
+                ],
             ),
             (
                 Part::Planning,
@@ -235,7 +242,7 @@ mod tests {
                     "agent register",
                     "--after",
                 ],
-                &["claim-next", "submit-review", "approve", "list ["],
+                &["claim-next", "submit-review", "approve", "list [", "skill"],
             ),
             (
                 Part::Board,
@@ -246,6 +253,7 @@ mod tests {
                     "status",
                     "agent list",
                     "init",
+                    "guide|skill [",
                     "--db",
                 ],
                 &["claim-next", "submit-review", "approve", "add --title"],

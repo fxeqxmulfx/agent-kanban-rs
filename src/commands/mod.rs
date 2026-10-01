@@ -2,6 +2,7 @@ pub mod agent;
 pub mod deps;
 pub mod guide;
 pub mod lifecycle;
+pub mod skill;
 pub mod status;
 pub mod task;
 pub mod view;
