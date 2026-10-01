@@ -899,7 +899,7 @@ fn init_stamps_the_current_schema_version() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
 
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert!(common::db_path(&dir).is_file());
 }
 
@@ -968,119 +968,9 @@ fn a_newer_schema_is_refused_instead_of_misread() {
         .execute_batch("PRAGMA user_version = 999;")
         .unwrap();
 
-    let message = "error: this project's schema version (999) is newer than this build of agent-kanban supports (3); upgrade agent-kanban";
+    let message = "error: this project's schema version (999) is newer than this build of agent-kanban supports (4); upgrade agent-kanban";
     assert_eq!(fail(&dir, &["agent", "list"]), message);
     assert_eq!(fail(&dir, &["init"]), message);
-}
-
-/// The tables exactly as 0.1.x created them: no roles, leases, reviews or
-/// dependencies.
-const V1_SCHEMA: &str = r#"
-CREATE TABLE agents (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE tasks (
-  id INTEGER PRIMARY KEY,
-  title TEXT NOT NULL,
-  priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
-  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
-  executor INTEGER REFERENCES agents(id),
-  tags TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags)),
-  tests TEXT NOT NULL CHECK (json_valid(tests) AND json_array_length(tests) > 0),
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-INSERT INTO agents (name) VALUES ('alice');
-INSERT INTO tasks (title, priority, status, executor, tests) VALUES
-  ('t1', 'medium', 'todo',        NULL, '[{"describe":"d","input":"i","output":"o"}]'),
-  ('t2', 'medium', 'in_progress', 1,    '[{"describe":"d","input":"i","output":"o"}]'),
-  ('t3', 'medium', 'review',      1,    '[{"describe":"d","input":"i","output":"o"}]'),
-  ('t4', 'medium', 'done',        1,    '[{"describe":"d","input":"i","output":"o"}]'),
-  ('t5', 'medium', 'backlog',     NULL, '[{"describe":"d","input":"i","output":"o"}]');
-"#;
-
-/// Boards written by 0.1.x (schema version 1, or 0 for the very first builds)
-/// are upgraded on first use. Their claims get a fresh one-hour lease; tasks
-/// that sat in the old, role-less `review` go back to development; finished
-/// tasks lose their owner. Nothing is lost.
-#[test]
-fn a_board_from_0_1_is_upgraded_on_first_use() {
-    for version in [0, 1] {
-        let dir = project();
-        std::fs::create_dir(dir.path().join(".kanban")).unwrap();
-        let conn = rusqlite::Connection::open(common::db_path(&dir)).unwrap();
-        conn.execute_batch(V1_SCHEMA).unwrap();
-        conn.execute_batch(&format!("PRAGMA user_version = {version};"))
-            .unwrap();
-        drop(conn);
-
-        assert_eq!(
-            run(&dir, &["list"]),
-            "#2 medium in_progress@alice t2\n#3 medium in_progress t3\n#1 medium todo t1\n\
-             #5 medium backlog t5\n+1 done hidden (--all)",
-            "version {version}"
-        );
-        assert_eq!(run(&dir, &["agent", "list"]), "alice developer");
-        assert_eq!(
-            run(&dir, &["status"]),
-            "backlog 1, todo 1, in_progress 2, review 0, done 1\nagents: alice 2"
-        );
-        let upgraded: i64 = common::db(&dir)
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(upgraded, 3, "version {version}");
-        // The upgraded board is fully usable: alice's old claim can be handed in.
-        assert_eq!(
-            run(
-                &dir,
-                &[
-                    "submit-review",
-                    "2",
-                    "--agent",
-                    "alice",
-                    "--pass",
-                    "0",
-                    "ok"
-                ]
-            ),
-            "#2 review rev1",
-            "version {version}"
-        );
-    }
-}
-
-/// A board created by 0.2 (schema 2, no dependency table) is upgraded in place
-/// the first time the new binary opens it, and keeps its data.
-#[test]
-fn a_version_2_board_is_upgraded_in_place() {
-    let dir = initialized();
-    register(&dir, "alice", "developer");
-    add_task(&dir, "old task", "high");
-    common::db(&dir)
-        .execute_batch("DROP TABLE task_deps; PRAGMA user_version = 2;")
-        .unwrap();
-
-    assert_eq!(run(&dir, &["list"]), "#1 high todo old task");
-
-    let conn = common::db(&dir);
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, 3);
-    drop(conn);
-    // The new table works: dependencies can be added right away.
-    assert_eq!(
-        run(
-            &dir,
-            &[
-                "add", "--title", "new", "--test", "d", "i", "o", "--after", "1"
-            ]
-        ),
-        "#2 todo after:1"
-    );
-    assert_eq!(run(&dir, &["agent", "list"]), "alice developer");
 }
 
 #[test]

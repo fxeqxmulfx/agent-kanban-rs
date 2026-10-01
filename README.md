@@ -180,7 +180,7 @@ Whoever starts an agent can put `agent-kanban guide developer` in its prompt and
 | `release ID [--agent A]` | `#7 STATUS` | The holder gives the task back; its status does not change. |
 | `move ID backlog\|todo` | `#7 STATUS` | Parks an unclaimed task in `backlog` or returns it to `todo`. Lifecycle statuses cannot be reached with `move`. |
 | `edit ID [--title T] [--priority P] [--tag X]... [--test D I O]... [--after IDS] [--drop-after IDS]` | `#7 STATUS` (plus `after:IDS`) | Updates an unclaimed task outside `review`/`done`. `--tag` and `--test` replace everything; `--after` adds prerequisites, `--drop-after` removes them. A task can never be edited down to zero tests. |
-| `remove ID` | `#7 removed` | Deletes an unclaimed task outside `review`/`done` that no other task waits for. |
+| `remove ID` | `#7 removed` | Deletes an unclaimed task outside `review`/`done` that no other task waits for. Its id is never handed out again, so a stale `#7` finds "not found", never a different task. |
 | `status` | `backlog 0, todo 3, in_progress 1, review 0, done 5` | Adds `; blocked N` when `todo` tasks wait for prerequisites, and a second line `agents: alice 7,9; bob -` with the tasks each agent holds. |
 
 Global flag: `--db <path>` uses that exact database file instead of discovering `.kanban/`
@@ -355,9 +355,10 @@ every question through filters (`--status`, `--tag`, `--priority`, `--executor`)
 
 ## Upgrading from 0.2
 
-Boards are migrated automatically (v2 → v3 adds the dependencies table); all tasks,
-agents and history are kept. A board touched by 0.3 cannot be opened by older builds. The
-command line was simplified and **the old forms were removed, not deprecated**:
+Boards are migrated automatically (v2 → v3 adds the dependencies table; v3 → v4 rebuilds
+`tasks` so that ids are never reused); all tasks, agents and history are kept. A board
+touched by 0.3 cannot be opened by older builds. The command line was simplified and
+**the old forms were removed, not deprecated**:
 
 | Removed | Use instead |
 |---|---|
@@ -378,6 +379,11 @@ current schema: existing agents become developers; active legacy claims on `in_p
 receive a one-hour lease; legacy `review` tasks return to unowned `in_progress` because v1
 has no recorded acceptance evidence to review; `done` keeps its status while any stale
 owner is cleared, so completed work never becomes active again.
+
+Task ids used to be recycled: removing the newest task freed its number, the next `add`
+took it, and a `#7` another agent still held then named a different task. Ids now only
+grow. The upgrade starts counting after the highest id on the board; a number freed
+*before* the upgrade is gone for good and may be handed out once more.
 
 ## License
 

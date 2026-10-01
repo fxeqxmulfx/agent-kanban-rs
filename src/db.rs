@@ -19,18 +19,21 @@ pub fn set_path_override(path: PathBuf) {
     let _ = PATH_OVERRIDE.set(path);
 }
 
-pub const SCHEMA_VERSION: i32 = 3;
+/// 1: 0.1.x. 2: roles, leases and review storage. 3: task dependencies.
+/// 4: task ids are never reused (`AUTOINCREMENT`).
+pub const SCHEMA_VERSION: i32 = 4;
 
-pub const SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS agents (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  role TEXT NOT NULL DEFAULT 'developer' CHECK (role IN ('developer','reviewer')),
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-  id INTEGER PRIMARY KEY,
+/// The columns and constraints of `tasks`, written once for both the schema
+/// script and the v4 rebuild, which creates the table under a temporary name.
+///
+/// `AUTOINCREMENT` makes SQLite remember the highest id it ever handed out.
+/// Without it the next id is `max(id) + 1`, so removing the newest task let the
+/// next `add` reuse its id, and a stale `#7` held by another agent could then
+/// name a different task.
+macro_rules! tasks_body {
+    () => {
+        r"(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   title TEXT NOT NULL,
   priority TEXT NOT NULL CHECK (priority IN ('low','medium','high','urgent')),
   status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('backlog','todo','in_progress','review','done')),
@@ -48,7 +51,22 @@ CREATE TABLE IF NOT EXISTS tasks (
     (executor IS NOT NULL AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL)
   ),
   CHECK (status != 'done' OR executor IS NULL)
+)"
+    };
+}
+
+pub const SCHEMA: &str = concat!(
+    r"
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'developer' CHECK (role IN ('developer','reviewer')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS tasks ",
+    tasks_body!(),
+    r";
 
 CREATE TABLE IF NOT EXISTS review_history (
   id INTEGER PRIMARY KEY,
@@ -91,7 +109,8 @@ CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
   ON acceptance_results(task_id, revision, criterion_index);
 CREATE INDEX IF NOT EXISTS task_deps_depends_on
   ON task_deps(depends_on);
-";
+"
+);
 
 /// Walk up from cwd looking for `.kanban/board.db`, like git looks for `.git`.
 /// Closest match wins; does not merge with a parent `.kanban/`.
@@ -234,6 +253,19 @@ fn migrate_schema(conn: &mut Connection) -> Result<()> {
         return Ok(());
     }
 
+    // Foreign keys are off for the whole migration: the v4 rebuild drops
+    // `tasks`, and with them on that would cascade into every review, result
+    // and dependency row that points at it. The pragma does nothing inside a
+    // transaction, so it brackets the transaction instead. A failed migration
+    // reports its own error, not the one from switching the keys back on.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let migrated = migrate_in_transaction(conn);
+    let restored = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    migrated?;
+    Ok(restored?)
+}
+
+fn migrate_in_transaction(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version = user_version(&tx)?;
     if version > SCHEMA_VERSION {
@@ -259,6 +291,7 @@ fn migrate_schema(conn: &mut Connection) -> Result<()> {
     // Every later table (review storage in v2, `task_deps` in v3) is created
     // by the idempotent schema script.
     tx.execute_batch(SCHEMA)?;
+    rebuild_tasks_with_autoincrement(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
     tx.commit()?;
     Ok(())
@@ -309,6 +342,45 @@ fn migrate_v1_to_v2(tx: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v4: give `tasks.id` `AUTOINCREMENT`. SQLite cannot add that to an existing
+/// column, so the table is rebuilt the way SQLite documents
+/// (<https://www.sqlite.org/lang_altertable.html#otheralter>): create the new
+/// table, copy every row with its id, drop the old table, rename the new one.
+/// Foreign keys must be off, see `migrate_schema`. The copy starts the id
+/// counter at the highest id in use, so no live id is handed out again; ids
+/// freed before the upgrade are gone for good and cannot be told apart.
+///
+/// A board is recognised by the shape of its table, not by its version: a
+/// brand-new board is stamped 0 yet already has the v4 table.
+fn rebuild_tasks_with_autoincrement(tx: &Connection) -> Result<()> {
+    if table_is_autoincrement(tx, "tasks")? {
+        return Ok(());
+    }
+    // The columns are named, not `SELECT *`: a table that came through the v1
+    // upgrade has `revision`, `claimed_at` and `lease_expires_at` last.
+    tx.execute_batch(&format!(
+        "CREATE TABLE tasks_new {};
+         INSERT INTO tasks_new (id, title, priority, status, executor, tags, tests, revision,
+                                claimed_at, lease_expires_at, created_at, updated_at)
+           SELECT id, title, priority, status, executor, tags, tests, revision,
+                  claimed_at, lease_expires_at, created_at, updated_at
+           FROM tasks;
+         DROP TABLE tasks;
+         ALTER TABLE tasks_new RENAME TO tasks;",
+        tasks_body!()
+    ))?;
+    Ok(())
+}
+
+fn table_is_autoincrement(conn: &Connection, table: &str) -> Result<bool> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(sql.to_ascii_uppercase().contains("AUTOINCREMENT"))
+}
+
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn
         .query_row(
@@ -334,6 +406,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::types::Value;
 
     #[test]
     fn schema_version_at_current_is_accepted() {
@@ -445,6 +518,13 @@ mod tests {
         assert!(table_exists(&conn, "review_history").unwrap());
         assert!(table_exists(&conn, "acceptance_results").unwrap());
         assert!(table_exists(&conn, "task_deps").unwrap());
+        // The v1 table has its added columns last; the rebuild must not care,
+        // and must keep every row under its own id.
+        assert!(table_is_autoincrement(&conn, "tasks").unwrap());
+        let ids = dump(&conn, "SELECT id, title FROM tasks ORDER BY id");
+        assert_eq!(ids.len(), 4);
+        assert_eq!(ids[3][1], Value::Text("unowned review".into()));
+        assert!(foreign_key_problems(&conn).is_empty());
     }
 
     /// The schema exactly as version 2 shipped it (no `task_deps`).
@@ -570,5 +650,192 @@ mod tests {
             conn.execute("DELETE FROM tasks WHERE id = 1", []).is_err(),
             "a prerequisite cannot be deleted while a task still waits on it"
         );
+        assert!(table_is_autoincrement(&conn, "tasks").unwrap());
+        assert!(foreign_key_problems(&conn).is_empty());
+    }
+
+    /// What version 3 added to version 2: the dependency table.
+    const V3_DEPS: &str = r"
+        CREATE TABLE task_deps (
+          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+          PRIMARY KEY (task_id, depends_on),
+          CHECK (task_id != depends_on)
+        );
+        PRAGMA user_version = 3;";
+
+    /// A version 3 board, the last one with a plain `INTEGER PRIMARY KEY`: task
+    /// ids 4 and 6 were removed, 7 is the newest, and every table that points
+    /// at `tasks` has a row.
+    fn board_v3() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute_batch(V2_SCHEMA).unwrap();
+        conn.execute_batch(V3_DEPS).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, role) VALUES (1, 'dev', 'developer'), (2, 'rev', 'reviewer');
+             INSERT INTO tasks (id, title, priority, status, tests, revision) VALUES
+               (1, 'base', 'high', 'done', '[\"c\"]', 1),
+               (2, 'next', 'low', 'todo', '[\"c\"]', 0),
+               (3, 'in review', 'medium', 'review', '[\"c\"]', 1),
+               (7, 'newest', 'urgent', 'backlog', '[\"c\"]', 0);
+             INSERT INTO tasks (id, title, priority, status, tests, executor, claimed_at, lease_expires_at)
+               VALUES (5, 'held', 'low', 'in_progress', '[\"c\"]', 1,
+                       datetime('now'), datetime('now', '+1 hour'));
+             INSERT INTO review_history (task_id, revision, decision, notes, executor, executor_name)
+               VALUES (1, 1, 'approved', 'ok', 2, 'rev');
+             INSERT INTO acceptance_results
+               (task_id, revision, criterion_index, criterion, result, evidence, executor, executor_name)
+               VALUES (1, 1, 0, '{}', 'passed', 'cargo test', 1, 'dev'),
+                      (3, 1, 0, '{}', 'failed', 'red', 1, 'dev');
+             INSERT INTO task_deps (task_id, depends_on) VALUES (2, 1), (7, 5);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Every row of a query, as SQLite stores it.
+    fn dump(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Everything the board holds, table by table, for before/after comparisons.
+    fn contents(conn: &Connection) -> Vec<Vec<Vec<Value>>> {
+        [
+            "SELECT * FROM agents ORDER BY id",
+            "SELECT id, title, priority, status, executor, tags, tests, revision,
+                    claimed_at, lease_expires_at, created_at, updated_at
+             FROM tasks ORDER BY id",
+            "SELECT * FROM review_history ORDER BY id",
+            "SELECT * FROM acceptance_results ORDER BY id",
+            "SELECT * FROM task_deps ORDER BY task_id, depends_on",
+        ]
+        .map(|sql| dump(conn, sql))
+        .to_vec()
+    }
+
+    /// Rows of `PRAGMA foreign_key_check`: references that point at nothing.
+    fn foreign_key_problems(conn: &Connection) -> Vec<Vec<Value>> {
+        dump(conn, "PRAGMA foreign_key_check")
+    }
+
+    fn pragma(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Insert a task and return the id SQLite gave it.
+    fn add_task(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO tasks (title, priority, tests) VALUES ('n', 'low', '[\"c\"]')",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_new_board_never_hands_out_an_id_twice() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert_eq!(add_task(&conn), 1);
+        assert_eq!(add_task(&conn), 2);
+        conn.execute("DELETE FROM tasks WHERE id = 2", []).unwrap();
+        assert_eq!(add_task(&conn), 3, "the newest id was removed, not freed");
+        conn.execute("DELETE FROM tasks", []).unwrap();
+        assert_eq!(add_task(&conn), 4, "even an empty board counts on");
+    }
+
+    #[test]
+    fn version_three_upgrade_rebuilds_tasks_and_keeps_every_row() {
+        let mut conn = board_v3();
+        assert!(!table_is_autoincrement(&conn, "tasks").unwrap());
+        let before = contents(&conn);
+        assert_eq!(before[1].len(), 5, "the fixture has five tasks");
+
+        migrate_schema(&mut conn).unwrap();
+        migrate_schema(&mut conn).unwrap();
+
+        assert_eq!(pragma(&conn, "user_version"), i64::from(SCHEMA_VERSION));
+        assert!(table_is_autoincrement(&conn, "tasks").unwrap());
+        assert_eq!(contents(&conn), before);
+        assert!(foreign_key_problems(&conn).is_empty());
+        assert_eq!(pragma(&conn, "foreign_keys"), 1, "switched back on");
+        assert!(!table_exists(&conn, "tasks_new").unwrap());
+    }
+
+    #[test]
+    fn version_three_upgrade_counts_on_from_the_highest_id() {
+        let mut conn = board_v3();
+        migrate_schema(&mut conn).unwrap();
+
+        assert_eq!(add_task(&conn), 8);
+        conn.execute("DELETE FROM tasks WHERE id = 8", []).unwrap();
+        assert_eq!(add_task(&conn), 9, "a removed id is not handed out again");
+    }
+
+    #[test]
+    fn version_three_upgrade_keeps_the_foreign_keys_working() {
+        let mut conn = board_v3();
+        migrate_schema(&mut conn).unwrap();
+
+        assert!(
+            conn.execute("DELETE FROM tasks WHERE id = 1", []).is_err(),
+            "task 2 still waits on task 1"
+        );
+        conn.execute("DELETE FROM tasks WHERE id = 3", []).unwrap();
+        let results = dump(&conn, "SELECT task_id FROM acceptance_results");
+        assert_eq!(
+            results,
+            [[Value::Integer(1)]],
+            "task 3's result went with it"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE tasks SET executor = 99, claimed_at = datetime('now'),
+                        lease_expires_at = datetime('now') WHERE id = 2",
+                [],
+            )
+            .is_err(),
+            "an owner that does not exist is refused"
+        );
+    }
+
+    /// A table that cannot be copied (here a row the new constraints refuse,
+    /// as a board that came through the v1 upgrade could hold) stops the whole
+    /// upgrade: nothing is half-done and the foreign keys come back on.
+    #[test]
+    fn a_failed_rebuild_changes_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let lenient =
+            V2_SCHEMA.replace("CHECK (status != 'done' OR executor IS NULL)", "CHECK (1)");
+        assert_ne!(lenient, V2_SCHEMA, "the fixture must drop the constraint");
+        conn.execute_batch(&lenient).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agents (id, name) VALUES (1, 'dev');
+             INSERT INTO tasks (id, title, priority, status, tests, executor, claimed_at, lease_expires_at)
+               VALUES (1, 'finished but owned', 'low', 'done', '[\"c\"]', 1,
+                       datetime('now'), datetime('now'));",
+        )
+        .unwrap();
+
+        let err = migrate_schema(&mut conn).unwrap_err();
+
+        assert!(err.to_string().contains("CHECK constraint failed"), "{err}");
+        assert_eq!(pragma(&conn, "user_version"), 2);
+        assert!(!table_is_autoincrement(&conn, "tasks").unwrap());
+        assert!(!table_exists(&conn, "tasks_new").unwrap());
+        assert!(
+            !table_exists(&conn, "task_deps").unwrap(),
+            "rolled back too"
+        );
+        assert_eq!(dump(&conn, "SELECT id FROM tasks"), [[Value::Integer(1)]]);
+        assert_eq!(pragma(&conn, "foreign_keys"), 1, "switched back on");
     }
 }
