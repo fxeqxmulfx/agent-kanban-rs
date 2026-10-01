@@ -353,6 +353,34 @@ scenario. So `list` stops at 20 rows unless told otherwise: 20 rows and the foot
 every question through filters (`--status`, `--tag`, `--priority`, `--executor`) or
 `--limit 0`.
 
+### Fewer turns
+
+What an agent pays for is often not the words of a command but the *turn* it takes: every
+call makes the model read the conversation so far again. Fewer calls beat shorter calls, and
+the shell already gives you what is needed, so `agent-kanban` has no flags for it:
+
+* **Chain with `&&`.** Hand work in and take the next task in one call. If the first command
+  is refused the chain stops and nothing is claimed:
+
+  ```sh
+  agent-kanban submit-review 7 --pass 0 "cargo test: ok" && agent-kanban claim-next
+  ```
+
+* **Wait with a bounded loop** when `claim-next` says `idle`, instead of one call per poll.
+  This one asks every 20 seconds, five times; it prints the work order as soon as there is
+  one, or the last `idle`, and it ends at once on an error such as an unregistered agent,
+  whose `error: ...` goes to stderr as usual:
+
+  ```sh
+  for i in $(seq 5); do o=$(agent-kanban claim-next); case "$o" in idle*) sleep 20;; *) break;; esac; done; echo "$o"
+  ```
+
+  Keep the total (about 100 s here) below the command time limit of whatever runs the agent
+  (two minutes by default in Claude Code), and call it again if it still says `idle`.
+
+* **Say who you are once.** Whoever starts an agent can `export AGENT_KANBAN_AGENT=alice`;
+  from then on no command needs `--agent NAME`.
+
 ## Upgrading from 0.2
 
 Boards are migrated automatically (v2 → v3 adds the dependencies table; v3 → v4 rebuilds
