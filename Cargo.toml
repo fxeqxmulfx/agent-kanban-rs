@@ -2,7 +2,7 @@
 name = "agent-kanban"
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.99"
 description = "Kanban CLI for multiple concurrent LLM agents to coordinate on tasks, backed by SQLite"
 license = "MIT"
 

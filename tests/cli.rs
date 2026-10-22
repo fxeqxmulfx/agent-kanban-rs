@@ -760,7 +760,7 @@ fn a_refusal_is_one_line_on_stderr_and_nothing_on_stdout() {
     let output = kanban(&dir).args(["show", "99"]).output().unwrap();
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         "error: task 99 not found\n"

@@ -111,7 +111,7 @@ fn an_unknown_prerequisite_creates_nothing() {
     );
 
     assert_eq!(run(&dir, &["list"]), "#1 medium todo a");
-    assert!(edges(&dir).is_empty());
+    assert_eq!(edges(&dir), []);
     // The id the failed add would have used is still free.
     assert_eq!(add_task(&dir, "b", "medium"), 2);
 }
@@ -138,7 +138,7 @@ fn edit_adds_and_drops_single_prerequisites() {
         "#3 todo after:1"
     );
     assert_eq!(run(&dir, &["edit", "3", "--drop-after", "1"]), "#3 todo");
-    assert!(edges(&dir).is_empty());
+    assert_eq!(edges(&dir), []);
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn edit_refuses_to_drop_an_edge_that_is_not_there_or_add_an_unknown_task() {
         fail(&dir, &["edit", "2", "--after", "99"]),
         "error: task 99 not found"
     );
-    assert!(edges(&dir).is_empty());
+    assert_eq!(edges(&dir), []);
 }
 
 #[test]
@@ -607,7 +607,7 @@ fn removing_a_waiting_task_frees_its_prerequisites_and_leaves_no_edges() {
     assert_eq!(edges(&dir), [(2, 1)]);
     assert!(common::task(&dir, &["show", "2"]).get("blocks").is_none());
     assert_eq!(run(&dir, &["remove", "2"]), "#2 removed");
-    assert!(edges(&dir).is_empty());
+    assert_eq!(edges(&dir), []);
     assert_eq!(run(&dir, &["remove", "1"]), "#1 removed");
     assert_eq!(run(&dir, &["list"]), "no tasks");
     assert_sound(&dir);

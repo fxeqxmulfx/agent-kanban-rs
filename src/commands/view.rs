@@ -922,8 +922,8 @@ mod tests {
         )
         .unwrap();
         let task = load(&conn, conn.last_insert_rowid()).unwrap();
-        assert!(task.tags.is_empty());
-        assert!(task.tests.is_empty());
+        assert_eq!(task.tags, Vec::<String>::new());
+        assert_eq!(task.tests, Vec::<Value>::new());
         assert_eq!(task.title, "t");
     }
 

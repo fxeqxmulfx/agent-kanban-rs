@@ -1042,7 +1042,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("claimed"), "{err}");
-        assert!(deps::open_prerequisites(&conn, claimed).unwrap().is_empty());
+        assert_eq!(
+            deps::open_prerequisites(&conn, claimed).unwrap(),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]
@@ -1126,7 +1129,10 @@ mod tests {
             title, "first",
             "the rename must be rolled back with the failed edge"
         );
-        assert!(deps::open_prerequisites(&conn, first).unwrap().is_empty());
+        assert_eq!(
+            deps::open_prerequisites(&conn, first).unwrap(),
+            Vec::<i64>::new()
+        );
     }
 
     #[test]

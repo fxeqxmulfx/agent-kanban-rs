@@ -26,7 +26,7 @@ entirely.
 
 ## Install / Build
 
-Requires Rust 1.95 or newer (stable, edition 2024).
+Requires Rust 1.99 or newer (stable, edition 2024).
 
 Install from [crates.io](https://crates.io/crates/agent-kanban) straight to `~/.cargo/bin`
 (already on `PATH` for most Rust setups):

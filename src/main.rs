@@ -65,7 +65,7 @@ enum Command {
     },
 
     /// Print the guide as a Claude Code skill (SKILL.md); save it as
-    /// .claude/skills/<its name>/SKILL.md
+    /// `.claude/skills/<its name>/SKILL.md`
     Skill {
         /// Only the part for this job; default: the whole guide
         part: Option<Part>,

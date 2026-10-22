@@ -181,11 +181,11 @@ mod tests {
         set_status(&conn, a, "done");
         assert_eq!(open_prerequisites(&conn, c).unwrap(), vec![b]);
         // Nothing waits on a finished task, even though `c` is still open.
-        assert!(open_dependents(&conn, a).unwrap().is_empty());
+        assert_eq!(open_dependents(&conn, a).unwrap(), Vec::<i64>::new());
         assert_eq!(open_dependents(&conn, b).unwrap(), vec![c]);
 
         set_status(&conn, c, "done");
-        assert!(open_dependents(&conn, b).unwrap().is_empty());
+        assert_eq!(open_dependents(&conn, b).unwrap(), Vec::<i64>::new());
     }
 
     #[test]
@@ -225,7 +225,7 @@ mod tests {
         let transitive = add_prerequisites(&conn, a, &[c]).unwrap_err().to_string();
         assert!(transitive.contains("cycle"), "{transitive}");
 
-        assert!(open_prerequisites(&conn, a).unwrap().is_empty());
+        assert_eq!(open_prerequisites(&conn, a).unwrap(), Vec::<i64>::new());
         // A diamond is not a cycle.
         let d = task(&conn, "todo");
         add_prerequisites(&conn, d, &[b, c]).unwrap();
@@ -248,7 +248,7 @@ mod tests {
         let (a, b) = (task(&conn, "todo"), task(&conn, "todo"));
         add_prerequisites(&conn, b, &[a]).unwrap();
         drop_prerequisites(&conn, b, &[a]).unwrap();
-        assert!(open_prerequisites(&conn, b).unwrap().is_empty());
+        assert_eq!(open_prerequisites(&conn, b).unwrap(), Vec::<i64>::new());
         assert_eq!(
             drop_prerequisites(&conn, b, &[a]).unwrap_err().to_string(),
             format!("task {b} does not come after {a}")

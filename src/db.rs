@@ -524,7 +524,7 @@ mod tests {
         let ids = dump(&conn, "SELECT id, title FROM tasks ORDER BY id");
         assert_eq!(ids.len(), 4);
         assert_eq!(ids[3][1], Value::Text("unowned review".into()));
-        assert!(foreign_key_problems(&conn).is_empty());
+        assert_eq!(foreign_key_problems(&conn), Vec::<Vec<Value>>::new());
     }
 
     /// The schema exactly as version 2 shipped it (no `task_deps`).
@@ -651,7 +651,7 @@ mod tests {
             "a prerequisite cannot be deleted while a task still waits on it"
         );
         assert!(table_is_autoincrement(&conn, "tasks").unwrap());
-        assert!(foreign_key_problems(&conn).is_empty());
+        assert_eq!(foreign_key_problems(&conn), Vec::<Vec<Value>>::new());
     }
 
     /// What version 3 added to version 2: the dependency table.
@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(pragma(&conn, "user_version"), i64::from(SCHEMA_VERSION));
         assert!(table_is_autoincrement(&conn, "tasks").unwrap());
         assert_eq!(contents(&conn), before);
-        assert!(foreign_key_problems(&conn).is_empty());
+        assert_eq!(foreign_key_problems(&conn), Vec::<Vec<Value>>::new());
         assert_eq!(pragma(&conn, "foreign_keys"), 1, "switched back on");
         assert!(!table_exists(&conn, "tasks_new").unwrap());
     }
