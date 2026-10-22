@@ -27,9 +27,9 @@ const fn description(part: Option<Part>) -> &'static str {
     match part {
         None => {
             "Use the agent-kanban task board. Claim the next task, hand it in for review with \
-             evidence, review the work of other agents, plan tasks and dependencies, inspect the \
-             board. Use when the project has a .kanban directory or when asked to pick up, \
-             review, plan or list tasks."
+             evidence, review the work of other agents, plan tasks and dependencies, inspect or \
+             dump the board. Use when the project has a .kanban directory or when asked to pick \
+             up, review, plan or list tasks."
         }
         Some(Part::Developer) => {
             "Do tasks from the agent-kanban board as a developer. Claim the next task, work on \
@@ -47,9 +47,9 @@ const fn description(part: Option<Part>) -> &'static str {
              organize tasks on the board."
         }
         Some(Part::Board) => {
-            "Look at the agent-kanban board. List and show tasks, see the status counts, which \
-             agent holds what and what is blocked. Use when asked what is on the board or who \
-             is working on what."
+            "Look at the agent-kanban board. List, show and dump tasks, see the status counts, \
+             which agent holds what and what is blocked. Use when asked what is on the board or \
+             who is working on what."
         }
     }
 }

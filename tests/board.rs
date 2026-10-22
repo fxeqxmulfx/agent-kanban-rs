@@ -870,6 +870,7 @@ fn commands_before_init_fail_cleanly() {
         &["agent", "list"],
         &["status"],
         &["show", "1"],
+        &["dump"],
     ] {
         assert_eq!(
             fail(&dir, args),
@@ -974,7 +975,7 @@ fn a_newer_schema_is_refused_instead_of_misread() {
 }
 
 #[test]
-fn only_show_and_claim_reply_with_a_task_block() {
+fn only_show_claim_and_dump_reply_with_task_blocks() {
     let dir = initialized();
     register(&dir, "dev", "developer");
     add_task(&dir, "t", "medium");
@@ -989,7 +990,11 @@ fn only_show_and_claim_reply_with_a_task_block() {
         assert!(!reply.contains('|'), "{reply}");
     }
     run(&dir, &["move", "1", "todo"]);
-    for args in [&["show", "1"][..], &["claim", "1", "--agent", "dev"]] {
+    for args in [
+        &["show", "1"][..],
+        &["dump"],
+        &["claim", "1", "--agent", "dev"],
+    ] {
         let reply = run(&dir, args);
         let mut lines = reply.lines();
         assert!(

@@ -258,6 +258,35 @@ pub fn show(id: i64, history: bool) -> Result<String> {
     view::show(&conn, id, history)
 }
 
+/// `dump` -> every task, done ones too, in id order, each as `show ID
+/// --history` prints it, a blank line apart: the whole board in one reply.
+/// No row is ever empty, so a blank line can only be a boundary.
+///
+/// Everything is read in one transaction, which in WAL mode is a snapshot:
+/// the dump is the board at one moment even while other agents work. A task
+/// removed meanwhile is in it whole or not at all, and a task approved
+/// meanwhile is not `done` in one place and still awaited in another.
+pub fn dump() -> Result<String> {
+    let mut conn = crate::db::open_existing()?;
+    let snapshot = conn.transaction()?;
+    dump_inner(&snapshot)
+}
+
+fn dump_inner(conn: &Connection) -> Result<String> {
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM tasks ORDER BY id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if ids.is_empty() {
+        return Ok("no tasks".to_string());
+    }
+    let tasks = ids
+        .into_iter()
+        .map(|id| view::show(conn, id, true))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(tasks.join("\n\n"))
+}
+
 #[derive(Default)]
 pub struct TaskEdit {
     pub title: Option<String>,
@@ -750,6 +779,33 @@ mod tests {
     fn list_of_an_empty_board_says_so() {
         let conn = setup();
         assert_eq!(list_inner(&conn, &no_filter()).unwrap(), "no tasks");
+    }
+
+    #[test]
+    fn dump_of_an_empty_board_says_so() {
+        let conn = setup();
+        assert_eq!(dump_inner(&conn).unwrap(), "no tasks");
+    }
+
+    #[test]
+    fn dump_is_show_history_of_every_task_in_id_order_done_included() {
+        let mut conn = setup();
+        let first = add_id(&mut conn, "first", "low");
+        let removed = add_id(&mut conn, "removed", "urgent");
+        let last = add_after(&mut conn, "last", &[first]);
+        remove_inner(&conn, removed).unwrap();
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?1", [first])
+            .unwrap();
+
+        let shown = |id| view::show(&conn, id, true).unwrap();
+        assert_eq!(
+            dump_inner(&conn).unwrap(),
+            format!("{}\n\n{}", shown(first), shown(last))
+        );
+        assert_eq!(
+            dump_inner(&conn).unwrap(),
+            format!("#{first} low done first\n0|d|in|out\n\n#{last} low todo last\n0|d|in|out")
+        );
     }
 
     #[test]

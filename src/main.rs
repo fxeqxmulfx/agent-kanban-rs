@@ -135,6 +135,10 @@ enum Command {
         history: bool,
     },
 
+    /// Print every task, done ones too, as `show --history` does, a blank
+    /// line apart
+    Dump,
+
     /// Claim one task and print its work order
     Claim {
         /// Task id
@@ -342,6 +346,7 @@ fn run(command: Command) -> Result<String> {
             limit,
         }),
         Command::Show { id, history } => commands::task::show(id, history),
+        Command::Dump => commands::task::dump(),
         Command::Edit {
             id,
             title,

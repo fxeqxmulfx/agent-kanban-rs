@@ -453,6 +453,10 @@ fn bad_arguments_are_usage_errors_with_a_clear_first_line() {
             "error: invalid value 'x' for '--limit <N>': invalid digit found in string",
         ),
         (
+            vec!["dump", "extra"],
+            "error: unexpected argument 'extra' found",
+        ),
+        (
             vec!["guide", "nosuch"],
             "error: invalid value 'nosuch' for '[PART]'",
         ),
@@ -715,6 +719,7 @@ fn every_reply_ends_with_exactly_one_newline() {
         &["add", "--title", "u", "--test", "d", "i", "o"],
         &["list"],
         &["show", "1"],
+        &["dump"],
         &["status"],
         &["agent", "list"],
         &["guide"],

@@ -213,6 +213,7 @@ mod tests {
                     "list [",
                     "agent register",
                     "skill",
+                    "dump",
                 ],
             ),
             (
@@ -230,6 +231,7 @@ mod tests {
                     "add --title",
                     "list [",
                     "skill",
+                    "dump",
                 ],
             ),
             (
@@ -242,7 +244,14 @@ mod tests {
                     "agent register",
                     "--after",
                 ],
-                &["claim-next", "submit-review", "approve", "list [", "skill"],
+                &[
+                    "claim-next",
+                    "submit-review",
+                    "approve",
+                    "list [",
+                    "skill",
+                    "dump",
+                ],
             ),
             (
                 Part::Board,
@@ -255,6 +264,7 @@ mod tests {
                     "init",
                     "guide|skill [",
                     "--db",
+                    "dump > FILE",
                 ],
                 &["claim-next", "submit-review", "approve", "add --title"],
             ),

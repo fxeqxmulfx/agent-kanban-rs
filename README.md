@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 450 tokens, or about 200 for just one job's part).
+command (`agent-kanban guide`, about 480 tokens, or about 200 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -144,6 +144,7 @@ PLANNING
 BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
   show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
+  dump: all tasks (done too) as show --history, a blank line apart; big board: dump > FILE
 In `|` lines \| \\ \n mean | \ and newline.
 ```
 
@@ -155,10 +156,10 @@ manual in the same order, so it cannot drift from it. Measured (`o200k_base`):
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 458 | 223 (−51%) | 199 (−57%) | 184 (−60%) | 158 (−66%) |
+| tokens | 484 | 223 (−54%) | 199 (−59%) | 184 (−62%) | 184 (−62%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
-230 tokens in every session of that agent.
+260 tokens in every session of that agent.
 
 ## As a Claude Code skill
 
@@ -184,9 +185,9 @@ need, not both, since they describe the same commands. The body is exactly what 
 `guide reviewer`, ...) prints, so the two cannot disagree; the file is a copy, so save it
 again after upgrading `agent-kanban`.
 
-What it costs (`o200k_base`): the description that is in every session is 39 to 61 tokens
+What it costs (`o200k_base`): the description that is in every session is 39 to 63 tokens
 depending on the skill, and the body, which is read only when the skill is used, is the
-guide's 158 to 458.
+guide's 184 to 484.
 
 ## Command reference
 
@@ -201,6 +202,7 @@ guide's 158 to 458.
 | `add --title T [--priority P] [--tag X]... --test DESC INPUT OUTPUT [--test ...]... [--after IDS]` | `#7 todo` or `#7 todo after:3,5` | Creates a task in `todo`. Priority defaults to `medium`. At least one `--test` is required; each takes exactly three values. `--after` lists prerequisites (comma-separated or repeated). |
 | `list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N]` | one `#ID PRIORITY STATUS[@agent][ after:IDS] TITLE` line per task | Ordered `in_progress`, `review`, `todo`, `backlog`, `done`, then by priority, then id. Done tasks are hidden unless `--all` or `--status done`. `--executor` only matches a live (unexpired) claim. Prints at most 20 rows unless `--limit N` says otherwise (`--limit 0` prints all), so one careless call cannot flood an agent's context. Footers: `+N more (--limit 0 = all)`, `+N done hidden (--all)`; an empty board prints `no tasks`. |
 | `show ID [--history]` | header line and `\|` rows ([format](#task-replies)) | Everything about one task; what is empty is left out. `--history` adds every past revision with its results and the review decision. |
+| `dump` | `show ID --history` of every task, a blank line apart, or `no tasks` | [The whole board](#the-whole-board) in one reply: done tasks included, in id order, read as one consistent snapshot. On a big board write it to a file (`dump > board.txt`). |
 | `claim ID [--agent A] [--lease SECS]` | work order (header line and `\|` rows) | A **developer** takes a `todo`, or an unclaimed/expired `in_progress`, task whose prerequisites are all done; it becomes `in_progress`. A **reviewer** takes a task in `review`; it stays in `review`. Claiming again as the holder renews the lease (default 3600 s). |
 | `claim-next [--agent A] [--lease SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. |
 | `submit-review ID [--agent A] (--pass IDX EVIDENCE \| --fail IDX EVIDENCE)...` | `#7 review rev1` | The developer holding the task gives exactly one verdict per test (index from 0) with non-empty evidence. Results, the new revision and the status change commit together. |
@@ -224,7 +226,7 @@ the `#7` spelling that replies use is accepted too.
 ### Replies, errors and exit codes
 
 Success: the reply on stdout, exit 0. Almost every reply is one short line; only task
-details (`show`, `claim`, `claim-next`) are longer, see [Task replies](#task-replies).
+details (`show`, `claim`, `claim-next`, `dump`) are longer, see [Task replies](#task-replies).
 
 A command that is understood but refused prints `error: <reason>` on stderr and exits 1,
 nothing on stdout. The reason says what to do next:
@@ -273,6 +275,25 @@ on `|` and a record never spans two lines: `\|`, `\\`, `\n` and `\r` stand for a
 backslash and line breaks. Quotes and everything else stay as typed, which is part of why
 this is cheaper than JSON. The one thing a row cannot protect is whitespace at the very end
 of a reply, where no `|` follows it and readers tend to trim.
+
+### The whole board
+
+`dump` prints every task, done ones included, in id order, each exactly as
+`show ID --history` prints it, with a blank line between two tasks. No row is ever empty and
+line breaks inside text are escaped, so a blank line can only be such a boundary. Everything
+is read in one transaction, so the dump shows the board at one moment even while other agents
+are changing it: a task removed meanwhile is in it whole or not at all, and a task approved
+meanwhile is never `done` in one place and still awaited in another.
+
+```sh
+agent-kanban dump              # into the agent's context: one call instead of list + a show per task
+agent-kanban dump > board.txt  # into a file: read it in parts, search it, keep it, hand it on
+```
+
+It grows with the board: on a test board of 1,000 tasks with three tests each, half of them
+submitted and their results in the history, it is about 78,000 tokens (`o200k_base`) and
+takes 0.04 s with a release build. On a big board, write it to a file and let the agent read
+or search that; an agent's shell tool may also cut long output short.
 
 ## Task dependencies
 
@@ -372,7 +393,7 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 450 tokens; one job's part about 150–220) replaces
+with one call, and `guide` (about 480 tokens; one job's part about 180–220) replaces
 reading the `--help` screens (about 2,300 tokens in total).
 
 The scenario's board is small. Output that grows with the board is the one cost nothing
@@ -380,7 +401,8 @@ above bounds: `list` on 300 tasks prints 300 rows, about 5,400 tokens, more than
 scenario. So `list` stops at 20 rows unless told otherwise: 20 rows and the footer
 `+280 more (--limit 0 = all)` cost about 370 tokens (−93%), and the board still answers
 every question through filters (`--status`, `--tag`, `--priority`, `--executor`) or
-`--limit 0`.
+`--limit 0`. `dump` is unbounded on purpose, since printing everything is its job; see
+[The whole board](#the-whole-board) for its size and for writing it to a file.
 
 ### Fewer turns
 
