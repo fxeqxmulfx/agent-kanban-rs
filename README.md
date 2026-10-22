@@ -514,6 +514,13 @@ the shell already gives you what is needed, so `agent-kanban` has no flags for i
 * **Say who you are once.** Whoever starts an agent can `export AGENT_KANBAN_AGENT=alice`;
   from then on no command needs `--agent NAME`.
 
+## Upgrading from 0.3
+
+Nothing to do: the board schema is still v4, so 0.3 and 0.4 open each other's boards, and
+every command works as before. 0.4 adds `dump` ([The whole board](#the-whole-board)) and
+`dump --full` with `load` ([Keeping the board in git](#keeping-the-board-in-git)), and needs
+Rust 1.99 or newer to build.
+
 ## Upgrading from 0.2
 
 Boards are migrated automatically (v2 → v3 adds the dependencies table; v3 → v4 rebuilds
