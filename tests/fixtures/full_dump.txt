@@ -1,0 +1,28 @@
+agent-kanban full dump 1
+next|10
+agent|1|dev|developer|2026-10-01 09:00:00
+agent|3|rev \| lead|reviewer|2026-10-01 09:00:05
+
+task|1|high|done|2|2026-10-01 09:01:00|2026-10-01 10:00:00|Parser \| lexer\nsecond line
+tags|api|needs review
+0|parses|1+1|2
+1|fails cleanly|1/0|error\\n
+result|1|0|passed|ok|1|dev|2026-10-01 09:10:00
+result|1|1|failed|panics|1|dev|2026-10-01 09:10:00|fails|1/0|err
+review|1|changes_requested|handle\ndivision by zero|3|rev \| lead|2026-10-01 09:20:00
+result|2|0|passed|still ok||gone|2026-10-01 09:30:00
+result|2|1|passed|error now|1|dev|2026-10-01 09:30:00
+result|2|2|passed|dropped test|1|dev|2026-10-01 09:30:00|old|in|out
+review|2|approved||3|rev \| lead|2026-10-01 10:00:00
+
+task|4|medium|review|1|2026-10-01 09:02:00|2026-10-01 11:00:00|Feature
+lease|3|2026-10-01 11:00:00|2026-10-01 12:00:00
+after|1
+0|works|in|out
+result|1|0|passed|ok|1|dev|2026-10-01 10:30:00
+
+task|7|low|backlog|0|2026-10-01 09:03:00|2026-10-01 09:03:00|Someday
+after|1,4
+0|works|in|out
+
+end

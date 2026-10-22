@@ -457,6 +457,15 @@ fn bad_arguments_are_usage_errors_with_a_clear_first_line() {
             "error: unexpected argument 'extra' found",
         ),
         (
+            vec!["dump", "--full", "extra"],
+            "error: unexpected argument 'extra' found",
+        ),
+        (vec!["load"], REQUIRED),
+        (
+            vec!["load", "a.txt", "b.txt"],
+            "error: unexpected argument 'b.txt' found",
+        ),
+        (
             vec!["guide", "nosuch"],
             "error: invalid value 'nosuch' for '[PART]'",
         ),
@@ -720,6 +729,7 @@ fn every_reply_ends_with_exactly_one_newline() {
         &["list"],
         &["show", "1"],
         &["dump"],
+        &["dump", "--full"],
         &["status"],
         &["agent", "list"],
         &["guide"],

@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod deps;
+pub mod full_dump;
 pub mod guide;
 pub mod lifecycle;
 pub mod skill;

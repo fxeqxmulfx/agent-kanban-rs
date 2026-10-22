@@ -871,6 +871,8 @@ fn commands_before_init_fail_cleanly() {
         &["status"],
         &["show", "1"],
         &["dump"],
+        &["dump", "--full"],
+        &["load", "kanban.txt"],
     ] {
         assert_eq!(
             fail(&dir, args),

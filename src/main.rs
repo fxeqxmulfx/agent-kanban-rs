@@ -137,7 +137,22 @@ enum Command {
 
     /// Print every task, done ones too, as `show --history` does, a blank
     /// line apart
-    Dump,
+    Dump {
+        /// Print everything the board holds instead, in the form `load` reads
+        /// (a file to keep in git)
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// Fill an empty board from a file `dump --full` wrote
+    Load {
+        /// The file; `-` reads standard input
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        /// Replace the board even if it is not empty
+        #[arg(long)]
+        replace: bool,
+    },
 
     /// Claim one task and print its work order
     Claim {
@@ -346,7 +361,9 @@ fn run(command: Command) -> Result<String> {
             limit,
         }),
         Command::Show { id, history } => commands::task::show(id, history),
-        Command::Dump => commands::task::dump(),
+        Command::Dump { full: false } => commands::task::dump(),
+        Command::Dump { full: true } => commands::full_dump::dump(),
+        Command::Load { file, replace } => commands::full_dump::load(&file, replace),
         Command::Edit {
             id,
             title,

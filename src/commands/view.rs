@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
@@ -41,6 +41,29 @@ pub fn cell(text: &str) -> String {
         }
     }
     out
+}
+
+/// The cells of a `|` row with their escaping undone: what [`cell`] wrote,
+/// read back. Refuses a `\` that [`cell`] would not have written.
+pub fn split(row: &str) -> Result<Vec<String>> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = row.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => current.push(match chars.next() {
+                Some('\\') => '\\',
+                Some('|') => '|',
+                Some('n') => '\n',
+                Some('r') => '\r',
+                _ => bail!(r"a \ must start \\, \|, \n or \r"),
+            }),
+            '|' => cells.push(std::mem::take(&mut current)),
+            other => current.push(other),
+        }
+    }
+    cells.push(current);
+    Ok(cells)
 }
 
 /// A task reply under construction: the header line, then `|` rows.
@@ -576,8 +599,21 @@ mod tests {
             .join("|");
         assert!(!row.contains(['\n', '\r']), "{row}");
         assert_eq!(cells(&row), nasty);
+        assert_eq!(split(&row).unwrap(), nasty);
         for text in nasty {
             assert_eq!(cells(&cell(text)), [text], "{text:?}");
+            assert_eq!(split(&cell(text)).unwrap(), [text], "{text:?}");
+        }
+    }
+
+    #[test]
+    fn split_refuses_what_cell_never_writes() {
+        for row in [r"a\tb", r"ends with \", r"\N"] {
+            assert_eq!(
+                split(row).unwrap_err().to_string(),
+                r"a \ must start \\, \|, \n or \r",
+                "{row}"
+            );
         }
     }
 

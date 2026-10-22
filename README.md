@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 480 tokens, or about 200 for just one job's part).
+command (`agent-kanban guide`, about 500 tokens, or about 200 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -145,6 +145,7 @@ BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
   show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
   dump: all tasks (done too) as show --history, a blank line apart; big board: dump > FILE
+  dump --full > FILE: the whole board for git; load FILE [--replace] restores it
 In `|` lines \| \\ \n mean | \ and newline.
 ```
 
@@ -156,10 +157,10 @@ manual in the same order, so it cannot drift from it. Measured (`o200k_base`):
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 484 | 223 (−54%) | 199 (−59%) | 184 (−62%) | 184 (−62%) |
+| tokens | 506 | 223 (−56%) | 199 (−61%) | 184 (−64%) | 206 (−59%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
-260 tokens in every session of that agent.
+280 tokens in every session of that agent.
 
 ## As a Claude Code skill
 
@@ -185,9 +186,9 @@ need, not both, since they describe the same commands. The body is exactly what 
 `guide reviewer`, ...) prints, so the two cannot disagree; the file is a copy, so save it
 again after upgrading `agent-kanban`.
 
-What it costs (`o200k_base`): the description that is in every session is 39 to 63 tokens
+What it costs (`o200k_base`): the description that is in every session is 39 to 65 tokens
 depending on the skill, and the body, which is read only when the skill is used, is the
-guide's 184 to 484.
+guide's 184 to 506.
 
 ## Command reference
 
@@ -203,6 +204,8 @@ guide's 184 to 484.
 | `list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N]` | one `#ID PRIORITY STATUS[@agent][ after:IDS] TITLE` line per task | Ordered `in_progress`, `review`, `todo`, `backlog`, `done`, then by priority, then id. Done tasks are hidden unless `--all` or `--status done`. `--executor` only matches a live (unexpired) claim. Prints at most 20 rows unless `--limit N` says otherwise (`--limit 0` prints all), so one careless call cannot flood an agent's context. Footers: `+N more (--limit 0 = all)`, `+N done hidden (--all)`; an empty board prints `no tasks`. |
 | `show ID [--history]` | header line and `\|` rows ([format](#task-replies)) | Everything about one task; what is empty is left out. `--history` adds every past revision with its results and the review decision. |
 | `dump` | `show ID --history` of every task, a blank line apart, or `no tasks` | [The whole board](#the-whole-board) in one reply: done tasks included, in id order, read as one consistent snapshot. On a big board write it to a file (`dump > board.txt`). |
+| `dump --full` | a [full dump](#keeping-the-board-in-git) | Everything the board holds, in the form `load` reads, to keep in git. One consistent snapshot. Refused if `load` would refuse what it printed. |
+| `load FILE [--replace]` | `loaded tasks N, agents M` | Fills an empty board from a `dump --full` file (`-` reads standard input); `--replace` replaces a board that is not empty. Checks the whole file, then writes it in one transaction. |
 | `claim ID [--agent A] [--lease SECS]` | work order (header line and `\|` rows) | A **developer** takes a `todo`, or an unclaimed/expired `in_progress`, task whose prerequisites are all done; it becomes `in_progress`. A **reviewer** takes a task in `review`; it stays in `review`. Claiming again as the holder renews the lease (default 3600 s). |
 | `claim-next [--agent A] [--lease SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. |
 | `submit-review ID [--agent A] (--pass IDX EVIDENCE \| --fail IDX EVIDENCE)...` | `#7 review rev1` | The developer holding the task gives exactly one verdict per test (index from 0) with non-empty evidence. Results, the new revision and the status change commit together. |
@@ -294,6 +297,85 @@ It grows with the board: on a test board of 1,000 tasks with three tests each, h
 submitted and their results in the history, it is about 78,000 tokens (`o200k_base`) and
 takes 0.04 s with a release build. On a big board, write it to a file and let the agent read
 or search that; an agent's shell tool may also cut long output short.
+
+A dump is for reading and cannot be loaded back: it leaves out the agent list, times, lease
+ends, dependencies on done tasks and the id counter. For a copy that can, see the next
+section.
+
+### Keeping the board in git
+
+The board is a SQLite file, which git can neither diff nor merge. `dump --full` prints all
+of it as text, and `load` turns that text back into the same board, so the board and its
+history can live in the repository next to the code:
+
+```sh
+echo .kanban/ >> .gitignore                       # the database itself stays out of git
+agent-kanban dump --full > kanban.txt && git add kanban.txt
+agent-kanban init && agent-kanban load kanban.txt # a fresh clone, or another machine
+git show HEAD~3:kanban.txt | agent-kanban load --replace -   # the board three commits ago
+```
+
+A full dump leaves nothing out: agents and their roles, the times, leases (a task that was
+held is held by the same agent until the same moment), every dependency including those on
+done tasks, the test each result judged when that test has changed since, the names of
+removed agents in the history, and the id counter. A board loaded from it has the same rows
+in every table as the board it came from (only the history rows' own ids, which nothing
+reads, are numbered afresh), so every command replies as it did there and work in progress
+carries on. Its lines come in a fixed order, so a change to the board changes only its own
+lines: a claim rewrites the task's line and adds a `lease` line, a submission rewrites it
+again, drops the `lease` line and adds a `result` line per test, a new task adds a block at
+the end and bumps `next`.
+
+```text
+agent-kanban full dump 1
+next|3
+agent|1|alice|developer|2026-10-01 09:00:00
+agent|2|bob|reviewer|2026-10-01 09:00:05
+
+task|1|high|done|1|2026-10-01 09:01:00|2026-10-01 09:40:00|Validate /login input
+0|rejects an empty password|{"password":""}|400
+result|1|0|passed|cargo test empty_password: ok|1|alice|2026-10-01 09:30:00
+review|1|approved||2|bob|2026-10-01 09:40:00
+
+task|2|medium|in_progress|1|2026-10-01 09:02:00|2026-10-01 10:15:00|Rate-limit /login
+lease|1|2026-10-01 10:15:00|2026-10-01 11:15:00
+after|1
+0|rejects a burst|11 requests in 1 s|429 on the 11th
+result|1|0|failed|panics on an empty key|1|alice|2026-10-01 09:55:00
+review|1|changes_requested|handle the empty-key case|2|bob|2026-10-01 10:05:00
+
+end
+```
+
+`agent` is `ID|NAME|ROLE|CREATED`; `task` is `ID|PRIORITY|STATUS|REVISION|CREATED|UPDATED|TITLE`;
+`lease` is `AGENT|CLAIMED|EXPIRES`; `result` is `REVISION|TEST|RESULT|EVIDENCE|AGENT|NAME|AT`,
+followed by the test it judged if that test has changed since; `review` is
+`REVISION|DECISION|NOTES|AGENT|NAME|AT`. AGENT is an agent's id, empty once the agent is
+removed. Times are UTC. Cells are escaped as in every reply.
+
+What `load` guarantees:
+
+* **All or nothing.** The whole file is checked before anything is written, then written in
+  one transaction. A bad line is named (`error: line 13: task 9 is not in the file`) and the
+  board stays as it was, with `--replace` too. A file cut short is refused, since its `end`
+  line is missing.
+* **An empty board only**, unless `--replace` is given; `init` makes one.
+* **Ids are never reused.** A board keeps counting from where it was: if it had handed out
+  `#9` after the dump was made, loading the older file does not make `#9` free again.
+* **What was printed loads.** `dump --full` checks its own text as `load` would and refuses
+  to print a board that `load` would not take back (only a database edited by hand holds
+  one), so the file in git does not fail on the day it is needed.
+
+Branches that changed different tasks merge cleanly, say a claim on one and a new task on
+the other. Boards on two machines hand out the same new ids, though, so tasks added on both
+sides conflict: give one of them the next free id by hand and raise `next`. `load` checks
+the merged file like any other, so a repeated id (`error: line 12: task 3 is already on
+line 11`), a `next` too low or an `after` naming a missing task is refused with its line.
+
+A full dump is for git, not for an agent to read: on the 1,000-task test board above it is
+about 137,000 tokens. Printing or loading 10,000 tasks takes about 0.2 s with a release
+build. `load` trusts the file as a backup is trusted: it can hold `done` tasks and
+approvals no reviewer gave on this board, so load only files you would commit yourself.
 
 ## Task dependencies
 
@@ -393,7 +475,7 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 480 tokens; one job's part about 180–220) replaces
+with one call, and `guide` (about 500 tokens; one job's part about 180–225) replaces
 reading the `--help` screens (about 2,300 tokens in total).
 
 The scenario's board is small. Output that grows with the board is the one cost nothing
