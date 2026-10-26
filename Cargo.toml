@@ -20,10 +20,10 @@ cargo_common_metadata = "allow"
 multiple_crate_versions = "allow"
 
 [dependencies]
-anyhow = "1.0.103"
-clap = { version = "4.6.1", features = ["derive", "env"] }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde_json = "1.0.150"
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

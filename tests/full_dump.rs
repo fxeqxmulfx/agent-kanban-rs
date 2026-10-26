@@ -45,7 +45,7 @@ fn rows(dir: &Path) -> Vec<String> {
     let mut rows = Vec::new();
     for table in tables {
         let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
-        let names: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
+        let names: Vec<String> = stmt.column_names().map(String::from).collect();
         let renumbered = matches!(table.as_str(), "review_history" | "acceptance_results");
         let mut query = stmt.query([]).unwrap();
         while let Some(row) = query.next().unwrap() {
