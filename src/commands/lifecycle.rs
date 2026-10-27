@@ -23,7 +23,7 @@ use super::{deps, view};
 pub const DEFAULT_LEASE_SECONDS: u32 = 3600;
 
 /// Run `f` inside one `IMMEDIATE` transaction, committed if `f` succeeds.
-fn write<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+pub(super) fn write<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     let mut conn = crate::db::open_existing()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let value = f(&tx)?;
@@ -31,13 +31,17 @@ fn write<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     Ok(value)
 }
 
-struct Agent {
+pub(super) struct Agent {
     id: i64,
     role: Role,
 }
 
 /// Look `name` up; with `required`, also insist on that role.
-fn resolve_agent(conn: &Connection, name: &str, required: Option<Role>) -> Result<Agent> {
+pub(super) fn resolve_agent(
+    conn: &Connection,
+    name: &str,
+    required: Option<Role>,
+) -> Result<Agent> {
     let row: Option<(i64, String)> = conn
         .query_row(
             "SELECT id, role FROM agents WHERE name = ?1",

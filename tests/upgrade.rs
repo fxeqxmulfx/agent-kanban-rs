@@ -1,13 +1,14 @@
 //! Boards written by older versions are upgraded in place the first time a new
 //! build opens them, and nothing on them is lost. Each fixture is a board as
 //! that version left it: v1 (0.1.x), v2 (0.2) and v3 (0.2.x and 0.3.0, in
-//! `tests/fixtures/board_v3.sql`). The upgrade to v4 rebuilds `tasks` so that
-//! task ids are never reused (see `src/db.rs`); what the rebuild must not
-//! touch is everything that points at `tasks`.
+//! `tests/fixtures/board_v3.sql`), v4 (0.4). The upgrade to v4 rebuilds
+//! `tasks` so that task ids are never reused (see `src/db.rs`); what the
+//! rebuild must not touch is everything that points at `tasks`. The upgrade
+//! to v5 adds the table that holds mail.
 
 mod common;
 
-use common::{add_task, fail, project, race, run};
+use common::{add_task, fail, initialized, project, race, register, run};
 use tempfile::TempDir;
 
 /// The tables exactly as 0.1.x created them: no roles, leases, reviews or
@@ -107,7 +108,7 @@ fn a_board_from_0_1_is_upgraded_on_first_use() {
             run(&dir, &["status"]),
             "backlog 1, todo 1, in_progress 2, review 0, done 1\nagents: alice 2"
         );
-        assert_eq!(schema_version(&dir), 4, "version {version}");
+        assert_eq!(schema_version(&dir), 5, "version {version}");
         assert_eq!(dangling_references(&dir), 0, "version {version}");
         // The upgraded board is fully usable: alice's old claim can be handed in.
         assert_eq!(
@@ -145,7 +146,7 @@ fn a_version_2_board_is_upgraded_in_place() {
          #7 low backlog newest\n#1 high done base"
     );
 
-    assert_eq!(schema_version(&dir), 4);
+    assert_eq!(schema_version(&dir), 5);
     assert_eq!(dangling_references(&dir), 0);
     // The new table works: dependencies can be added right away.
     assert_eq!(
@@ -200,7 +201,7 @@ fn a_version_3_board_is_upgraded_in_place_and_keeps_everything() {
         "backlog 1, todo 1, in_progress 1, review 1, done 1\nagents: alice 5; rita -"
     );
 
-    assert_eq!(schema_version(&dir), 4);
+    assert_eq!(schema_version(&dir), 5);
     assert_eq!(dangling_references(&dir), 0);
     for (table, rows) in [
         ("agents", 2),
@@ -208,6 +209,7 @@ fn a_version_3_board_is_upgraded_in_place_and_keeps_everything() {
         ("review_history", 2),
         ("acceptance_results", 3),
         ("task_deps", 2),
+        ("messages", 0),
     ] {
         assert_eq!(count(&dir, table), rows, "{table}");
     }
@@ -246,6 +248,34 @@ fn an_upgraded_board_never_reuses_an_id() {
     );
 }
 
+/// A board as 0.4 left it: everything of today but the mail table. The first
+/// command of a new build adds the table and leaves the rest as it was.
+#[test]
+fn a_version_4_board_gets_mail() {
+    let dir = initialized();
+    register(&dir, "alice", "developer");
+    register(&dir, "rita", "reviewer");
+    add_task(&dir, "keep me", "high");
+    common::db(&dir)
+        .execute_batch("DROP TABLE messages; PRAGMA user_version = 4;")
+        .unwrap();
+
+    assert_eq!(
+        run(&dir, &["send", "rita", "hi", "--agent", "alice"]),
+        "sent"
+    );
+
+    assert_eq!(schema_version(&dir), 5);
+    assert_eq!(run(&dir, &["inbox", "--agent", "rita"]), "alice||hi");
+    assert_eq!(run(&dir, &["list"]), "#1 high todo keep me");
+    assert_eq!(
+        run(&dir, &["agent", "list"]),
+        "alice developer\nrita reviewer"
+    );
+    assert_eq!(dangling_references(&dir), 0);
+    assert_eq!(add_task(&dir, "new", "low"), 2);
+}
+
 /// `init` on an old board runs the same upgrade as any other command.
 #[test]
 fn init_upgrades_an_old_board_too() {
@@ -253,7 +283,7 @@ fn init_upgrades_an_old_board_too() {
 
     assert_eq!(run(&dir, &["init"]), "initialized");
 
-    assert_eq!(schema_version(&dir), 4);
+    assert_eq!(schema_version(&dir), 5);
     assert_eq!(dangling_references(&dir), 0);
     assert_eq!(count(&dir, "tasks"), 5);
     assert_eq!(add_task(&dir, "new", "low"), 8);
@@ -275,7 +305,7 @@ fn processes_upgrading_one_board_at_once_all_succeed() {
             assert_eq!(outcome.stderr, "", "round {round}");
             assert_eq!(outcome.stdout, outcomes[0].stdout, "round {round}");
         }
-        assert_eq!(schema_version(&dir), 4, "round {round}");
+        assert_eq!(schema_version(&dir), 5, "round {round}");
         assert_eq!(dangling_references(&dir), 0, "round {round}");
         assert_eq!(count(&dir, "tasks"), 5, "round {round}");
         assert_eq!(count(&dir, "acceptance_results"), 3, "round {round}");

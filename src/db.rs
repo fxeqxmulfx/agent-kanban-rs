@@ -20,8 +20,8 @@ pub fn set_path_override(path: PathBuf) {
 }
 
 /// 1: 0.1.x. 2: roles, leases and review storage. 3: task dependencies.
-/// 4: task ids are never reused (`AUTOINCREMENT`).
-pub const SCHEMA_VERSION: i32 = 4;
+/// 4: task ids are never reused (`AUTOINCREMENT`). 5: mail between agents.
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// The columns and constraints of `tasks`, written once for both the schema
 /// script and the v4 rebuild, which creates the table under a temporary name.
@@ -103,12 +103,28 @@ CREATE TABLE IF NOT EXISTS task_deps (
   CHECK (task_id != depends_on)
 );
 
+-- Mail between agents, addressed by name: it outlives the agents that sent
+-- or got it, and reaches whoever registers the name again. `task_id` is a
+-- plain id, not a reference: ids are never reused, so mail about a removed
+-- task keeps its `#7` and that can never name another task.
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY,
+  sender TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  task_id INTEGER CHECK (task_id > 0),
+  body TEXT NOT NULL CHECK (length(trim(body)) > 0),
+  sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+  read_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS review_history_task_revision
   ON review_history(task_id, revision);
 CREATE INDEX IF NOT EXISTS acceptance_results_task_revision
   ON acceptance_results(task_id, revision, criterion_index);
 CREATE INDEX IF NOT EXISTS task_deps_depends_on
   ON task_deps(depends_on);
+CREATE INDEX IF NOT EXISTS messages_recipient_unread
+  ON messages(recipient, read_at);
 "
 );
 
@@ -288,8 +304,8 @@ fn migrate_in_transaction(conn: &mut Connection) -> Result<()> {
     if version < 2 {
         migrate_v1_to_v2(&tx)?;
     }
-    // Every later table (review storage in v2, `task_deps` in v3) is created
-    // by the idempotent schema script.
+    // Every later table (review storage in v2, `task_deps` in v3, `messages`
+    // in v5) is created by the idempotent schema script.
     tx.execute_batch(SCHEMA)?;
     rebuild_tasks_with_autoincrement(&tx)?;
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
@@ -518,6 +534,7 @@ mod tests {
         assert!(table_exists(&conn, "review_history").unwrap());
         assert!(table_exists(&conn, "acceptance_results").unwrap());
         assert!(table_exists(&conn, "task_deps").unwrap());
+        assert!(table_exists(&conn, "messages").unwrap());
         // The v1 table has its added columns last; the rebuild must not care,
         // and must keep every row under its own id.
         assert!(table_is_autoincrement(&conn, "tasks").unwrap());

@@ -104,9 +104,9 @@ fn a_guide_part_prints_only_that_part_and_needs_no_board() {
             .collect()
     };
     let cases: [(&str, &[&str]); 4] = [
-        ("developer", &["WORK", "DEVELOPER"]),
-        ("reviewer", &["WORK", "REVIEWER"]),
-        ("planning", &["PLANNING"]),
+        ("developer", &["WORK", "DEVELOPER", "MAIL"]),
+        ("reviewer", &["WORK", "REVIEWER", "MAIL"]),
+        ("planning", &["PLANNING", "MAIL"]),
         ("board", &["BOARD"]),
     ];
 
@@ -128,7 +128,7 @@ fn a_guide_part_prints_only_that_part_and_needs_no_board() {
     }
     assert_eq!(
         headings(&whole),
-        ["WORK", "DEVELOPER", "REVIEWER", "PLANNING", "BOARD"]
+        ["WORK", "DEVELOPER", "REVIEWER", "PLANNING", "BOARD", "MAIL"]
     );
 }
 

@@ -1,4 +1,4 @@
-agent-kanban full dump 1
+agent-kanban full dump 2
 next|10
 agent|1|dev|developer|2026-10-01 09:00:00
 agent|3|rev \| lead|reviewer|2026-10-01 09:00:05
@@ -24,5 +24,9 @@ result|1|0|passed|ok|1|dev|2026-10-01 10:30:00
 task|7|low|backlog|0|2026-10-01 09:03:00|2026-10-01 09:03:00|Someday
 after|1,4
 0|works|in|out
+
+mail|dev|rev \| lead|4|2026-10-01 10:31:00|2026-10-01 10:40:00|ready for review\nsee notes
+mail|rev \| lead|dev||2026-10-01 10:45:00||thanks \| ok
+mail|gone|dev|9|2026-10-01 11:00:00||about a removed task
 
 end

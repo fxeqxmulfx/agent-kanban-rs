@@ -3,13 +3,14 @@
 //!
 //! `dump` is for reading and leaves out what an agent never needs. A full dump
 //! leaves out nothing: agents, times, leases, every dependency (done
-//! prerequisites too), the test each result was given against and the id
-//! counter, so that `load` rebuilds the same board. Its order is fixed (agents
-//! and tasks by id, a task's history by revision): the same board always
-//! prints the same text, and a change to the board changes only its own lines.
+//! prerequisites too), the test each result was given against, the mail, read
+//! or not, and the id counter, so that `load` rebuilds the same board. Its
+//! order is fixed (agents and tasks by id, a task's history by revision, mail
+//! as it was sent): the same board always prints the same text, and a change
+//! to the board changes only its own lines.
 //!
 //! ```text
-//! agent-kanban full dump 1          the version of this format
+//! agent-kanban full dump 2          the version of this format
 //! next|8                            the id the next `add` gets
 //! agent|ID|NAME|ROLE|CREATED        one line per agent
 //!                                   a blank line before each task
@@ -20,14 +21,20 @@
 //! IDX|DESCRIBE|INPUT|OUTPUT         one line per test, as `show` prints it
 //! result|REV|IDX|RESULT|EVIDENCE|AGENT|BY|AT[|DESCRIBE|INPUT|OUTPUT]
 //! review|REV|DECISION|NOTES|AGENT|BY|AT
+//!                                   a blank line before the mail, if any
+//! mail|FROM|TO|TASK|SENT|READ|TEXT  one line per message, oldest first
 //!                                   a blank line
 //! end                               the file is whole
 //! ```
 //!
 //! AGENT is an agent's id, empty once that agent has been removed; BY is the
 //! name recorded with the result or review. A result repeats the test it
-//! judged only if that test has changed since. Times are UTC, as SQLite writes
-//! them. Cells are escaped as in every reply (see [`view::cell`]).
+//! judged only if that test has changed since. Mail keeps the names and the
+//! task id `send` was given, so FROM and TO need not be agents of the file
+//! nor TASK one of its tasks; TASK is empty for mail about no task, READ for
+//! mail not yet read. Times are UTC, as SQLite writes them. Cells are escaped
+//! as in every reply (see [`view::cell`]). Format 1, which 0.4 wrote, is this
+//! format without mail; it loads as well.
 //!
 //! `load` checks the whole file before it writes anything, then writes it in
 //! one transaction: the board becomes the file, or stays as it was. `dump
@@ -47,7 +54,7 @@ use super::{PRIORITIES, STATUSES, deps, view};
 /// The first line of a full dump, up to its version.
 const HEADER: &str = "agent-kanban full dump";
 /// The version of the format this build writes, and the newest it reads.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
 
 const ROLES: [&str; 2] = ["developer", "reviewer"];
 const RESULTS: [&str; 2] = ["passed", "failed"];
@@ -60,6 +67,8 @@ struct Board {
     next: i64,
     agents: Vec<Agent>,
     tasks: Vec<Task>,
+    /// Oldest first.
+    mail: Vec<Mail>,
 }
 
 struct Agent {
@@ -143,6 +152,18 @@ struct Review {
     at: String,
 }
 
+/// A message, as `send` left it.
+struct Mail {
+    from: String,
+    to: String,
+    /// The task it is about: a plain id, which may name a removed task.
+    task: Option<i64>,
+    sent: String,
+    /// When `inbox` handed it over; `None` while it waits.
+    read: Option<String>,
+    text: String,
+}
+
 /// `dump --full` -> the whole board in the format above. It is read in one
 /// transaction, like `dump`, so it is the board at one moment.
 pub fn dump() -> Result<String> {
@@ -158,8 +179,9 @@ pub fn dump() -> Result<String> {
     Ok(text)
 }
 
-/// `load FILE [--replace]` -> `loaded tasks N, agents M`; `-` is standard
-/// input. Fills an empty board; `replace` lets it replace one that is not.
+/// `load FILE [--replace]` -> `loaded tasks N, agents M[, mail K]`; `-` is
+/// standard input. Fills an empty board; `replace` lets it replace one that
+/// is not.
 pub fn load(file: &Path, replace: bool) -> Result<String> {
     let mut conn = crate::db::open_existing()?;
     let board = parse(&read_file(file)?)?;
@@ -167,10 +189,20 @@ pub fn load(file: &Path, replace: bool) -> Result<String> {
     restore(&tx, &board, replace)?;
     tx.commit()?;
     Ok(format!(
-        "loaded tasks {}, agents {}",
+        "loaded tasks {}, agents {}{}",
         board.tasks.len(),
-        board.agents.len()
+        board.agents.len(),
+        mail_count(i64::try_from(board.mail.len())?)
     ))
+}
+
+/// `, mail N`, or nothing for a board without mail.
+fn mail_count(count: i64) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(", mail {count}")
+    }
 }
 
 fn read_file(file: &Path) -> Result<String> {
@@ -186,21 +218,23 @@ fn read_file(file: &Path) -> Result<String> {
 /// Put `board` in place of what the database holds, inside the caller's
 /// transaction.
 fn restore(tx: &Connection, board: &Board, replace: bool) -> Result<()> {
-    let (tasks, agents): (i64, i64) = tx.query_row(
-        "SELECT (SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM agents)",
+    let (tasks, agents, mail): (i64, i64, i64) = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM agents),
+                (SELECT COUNT(*) FROM messages)",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if tasks + agents > 0 {
+    if tasks + agents + mail > 0 {
         if !replace {
             bail!(
-                "the board is not empty (tasks {tasks}, agents {agents}); \
-                 `load --replace FILE` replaces it"
+                "the board is not empty (tasks {tasks}, agents {agents}{}); \
+                 `load --replace FILE` replaces it",
+                mail_count(mail)
             );
         }
         tx.execute_batch(
             "DELETE FROM task_deps; DELETE FROM acceptance_results; DELETE FROM review_history;
-             DELETE FROM tasks; DELETE FROM agents;",
+             DELETE FROM tasks; DELETE FROM agents; DELETE FROM messages;",
         )?;
     }
     // An id this database has handed out stays spent, even when the file is
@@ -310,6 +344,16 @@ fn write(tx: &Connection, board: &Board) -> Result<()> {
             ])?;
         }
     }
+    // In the file's order, which is the order `inbox` hands them over in.
+    let mut insert_mail = tx.prepare(
+        "INSERT INTO messages (sender, recipient, task_id, sent_at, read_at, body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for mail in &board.mail {
+        insert_mail.execute(rusqlite::params![
+            mail.from, mail.to, mail.task, mail.sent, mail.read, mail.text
+        ])?;
+    }
     Ok(())
 }
 
@@ -332,7 +376,34 @@ fn read(conn: &Connection) -> Result<Board> {
         next: last_id(conn)? + 1,
         agents,
         tasks,
+        mail: read_mail(conn)?,
     })
+}
+
+fn read_mail(conn: &Connection) -> Result<Vec<Mail>> {
+    let mail: Vec<Mail> = conn
+        .prepare(
+            "SELECT sender, recipient, task_id, sent_at, read_at, body FROM messages ORDER BY id",
+        )?
+        .query_map([], |row| {
+            Ok(Mail {
+                from: row.get(0)?,
+                to: row.get(1)?,
+                task: row.get(2)?,
+                sent: row.get(3)?,
+                read: row.get(4)?,
+                text: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // An empty cell reads back as mail not yet read.
+    if mail.iter().any(|mail| mail.read.as_deref() == Some("")) {
+        bail!(
+            "a message has an empty read time, which agent-kanban never writes; a full dump \
+             cannot keep it"
+        );
+    }
+    Ok(mail)
 }
 
 fn read_tasks(conn: &Connection) -> Result<Vec<Task>> {
@@ -453,6 +524,10 @@ fn render(board: &Board) -> String {
         lines.push(String::new());
         render_task(task, &mut lines);
     }
+    if !board.mail.is_empty() {
+        lines.push(String::new());
+        lines.extend(board.mail.iter().map(mail_line));
+    }
     lines.extend([String::new(), "end".to_string()]);
     lines.join("\n")
 }
@@ -516,7 +591,7 @@ fn result_line(task: &Task, result: &Verdict) -> String {
     let (revision, index, agent) = (
         result.revision.to_string(),
         result.index.to_string(),
-        agent_cell(result.agent),
+        id_cell(result.agent),
     );
     let mut cells = vec![
         "result",
@@ -548,14 +623,27 @@ fn review_line(review: &Review) -> String {
         &review.revision.to_string(),
         &review.decision,
         &review.notes,
-        &agent_cell(review.agent),
+        &id_cell(review.agent),
         &review.by,
         &review.at,
     ])
 }
 
-fn agent_cell(agent: Option<i64>) -> String {
-    agent.map(|id| id.to_string()).unwrap_or_default()
+fn mail_line(mail: &Mail) -> String {
+    row(&[
+        "mail",
+        &mail.from,
+        &mail.to,
+        &id_cell(mail.task),
+        &mail.sent,
+        mail.read.as_deref().unwrap_or_default(),
+        &mail.text,
+    ])
+}
+
+/// An id, or an empty cell for none.
+fn id_cell(id: Option<i64>) -> String {
+    id.map(|id| id.to_string()).unwrap_or_default()
 }
 
 /// Read a full dump back, or say on which line it goes wrong, and why.
@@ -593,8 +681,8 @@ fn header(line: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("not a full dump: its first line is `{HEADER} {FORMAT}`"))?;
     if version > FORMAT {
         bail!(
-            "written by a newer agent-kanban (format {version}; this build reads {FORMAT}); \
-             upgrade agent-kanban"
+            "written by a newer agent-kanban (format {version}; this build reads up to \
+             {FORMAT}); upgrade agent-kanban"
         );
     }
     Ok(())
@@ -615,6 +703,8 @@ struct Reader {
     /// Results that leave out the test they judged, which is then the task's
     /// test with their index: (line, task, result), the last two positions.
     unnamed: Vec<(usize, usize, usize)>,
+    /// The line of each message about a task, and that task.
+    mail_tasks: Vec<(usize, i64)>,
     /// Whether the `end` line has been read.
     ended: bool,
 }
@@ -641,6 +731,7 @@ impl Reader {
             "after" => self.after(number, &values),
             "result" => self.result(number, &values),
             "review" => self.review(&values),
+            "mail" => self.mail(number, &values),
             index if !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) => {
                 self.test(index, &values)
             }
@@ -650,6 +741,7 @@ impl Reader {
 
     /// `next` and `agent` describe the whole board, so they come first.
     fn before_tasks(&self, kind: &str) -> Result<()> {
+        self.before_mail(&format!("`{kind}`"))?;
         if self.board.tasks.is_empty() {
             Ok(())
         } else {
@@ -657,8 +749,19 @@ impl Reader {
         }
     }
 
+    /// The mail comes last, so that a task cannot end up after it, or a line
+    /// meant for one task in another.
+    fn before_mail(&self, what: &str) -> Result<()> {
+        if self.board.mail.is_empty() {
+            Ok(())
+        } else {
+            bail!("{what} must come before the mail")
+        }
+    }
+
     /// The position of the task a line belongs to: the last one begun.
     fn current(&self, what: &str) -> Result<usize> {
+        self.before_mail(what)?;
         self.board
             .tasks
             .len()
@@ -700,6 +803,7 @@ impl Reader {
     }
 
     fn task(&mut self, number: usize, values: &[String]) -> Result<()> {
+        self.before_mail("`task`")?;
         let [id, priority, status, revision, created, updated, title] = values else {
             return Err(arity("task", "7 values", values));
         };
@@ -891,6 +995,33 @@ impl Reader {
         Ok(())
     }
 
+    /// Mail is kept by name, as `send` took it: FROM and TO need not be
+    /// agents of the file, nor TASK one of its tasks.
+    fn mail(&mut self, number: usize, values: &[String]) -> Result<()> {
+        let [from, to, task, sent, read, text] = values else {
+            return Err(arity("mail", "6 values", values));
+        };
+        let task = (!task.is_empty()).then(|| id_number(task)).transpose()?;
+        let sent = time(sent)?;
+        let read = (!read.is_empty()).then(|| time(read)).transpose()?;
+        // As the schema has it: SQLite's trim() takes off spaces only.
+        if text.trim_matches(' ').is_empty() {
+            bail!("message must not be empty");
+        }
+        if let Some(task) = task {
+            self.mail_tasks.push((number, task));
+        }
+        self.board.mail.push(Mail {
+            from: from.clone(),
+            to: to.clone(),
+            task,
+            sent,
+            read,
+            text: text.clone(),
+        });
+        Ok(())
+    }
+
     /// An agent the file has already listed.
     fn agent_id(&self, text: &str) -> Result<i64> {
         let id = integer(text)?;
@@ -947,6 +1078,13 @@ impl Reader {
         {
             let reason = anyhow!("next {} is not above task {last}", self.board.next);
             return Err((next_line, reason));
+        }
+        // An id not handed out yet goes to a task added later, and the mail
+        // would then be about that task.
+        let next = self.board.next;
+        if let Some(&(line, task)) = self.mail_tasks.iter().find(|(_, task)| *task >= next) {
+            let reason = anyhow!("task {task} was never handed out (next is {next})");
+            return Err((line, reason));
         }
         self.check_dependencies()?;
         Ok(self.board)
@@ -1073,7 +1211,7 @@ mod tests {
     const FULL: &str = include_str!("../../tests/fixtures/full_dump.txt");
 
     /// A full dump of an empty board that has never handed out an id.
-    const EMPTY: &str = "agent-kanban full dump 1\nnext|1\n\nend\n";
+    const EMPTY: &str = "agent-kanban full dump 2\nnext|1\n\nend\n";
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1147,23 +1285,23 @@ mod tests {
     /// numbers are those of the edited file.
     const REFUSALS: &[(&str, &str, &str)] = &[
         (
-            "agent-kanban full dump 1",
             "agent-kanban full dump 2",
-            "line 1: written by a newer agent-kanban (format 2; this build reads 1); \
+            "agent-kanban full dump 3",
+            "line 1: written by a newer agent-kanban (format 3; this build reads up to 2); \
                  upgrade agent-kanban",
         ),
         (
-            "agent-kanban full dump 1",
+            "agent-kanban full dump 2",
             "agent-kanban full dump 0",
-            "line 1: not a full dump: its first line is `agent-kanban full dump 1`",
+            "line 1: not a full dump: its first line is `agent-kanban full dump 2`",
         ),
         (
-            "agent-kanban full dump 1",
+            "agent-kanban full dump 2",
             "agent-kanban full dump",
-            "line 1: not a full dump: its first line is `agent-kanban full dump 1`",
+            "line 1: not a full dump: its first line is `agent-kanban full dump 2`",
         ),
         (
-            "agent-kanban full dump 1",
+            "agent-kanban full dump 2",
             "#1 high done rev2 Parser",
             "line 1: this is a `dump` for reading; load reads what `dump --full` writes",
         ),
@@ -1185,8 +1323,8 @@ mod tests {
             "line 3: a second `next` line",
         ),
         (
-            "\nend\n",
-            "\nagent|9|late|developer|2026-10-01 09:00:00\nend\n",
+            "\nmail|dev|",
+            "\nagent|9|late|developer|2026-10-01 09:00:00\nmail|dev|",
             "line 28: `agent` lines come before the first task",
         ),
         ("agent|3|", "agent|1|", "line 4: a second agent 1"),
@@ -1409,16 +1547,62 @@ mod tests {
             r"line 7: a \ must start \\, \|, \n or \r",
         ),
         (
+            "||about a removed task",
+            "|about a removed task",
+            "line 30: `mail` takes 6 values after it, not 5",
+        ),
+        (
+            "|dev|9|",
+            "|dev|0|",
+            "line 30: '0' is not an id: ids start at 1",
+        ),
+        ("|dev|9|", "|dev|#9|", "line 30: '#9' is not a whole number"),
+        (
+            "|dev|9|",
+            "|dev|10|",
+            "line 30: task 10 was never handed out (next is 10)",
+        ),
+        (
+            "|9|2026-10-01 11:00:00|",
+            "|9|later|",
+            "line 30: 'later' is not a time like 2026-01-31 23:59:00",
+        ),
+        (
+            "|2026-10-01 10:40:00|",
+            "|read|",
+            "line 28: 'read' is not a time like 2026-01-31 23:59:00",
+        ),
+        (
+            "||about a removed task",
+            "||  ",
+            "line 30: message must not be empty",
+        ),
+        (
+            "\nend\n",
+            "\ntask|8|low|todo|0|2026-10-01 09:00:00|2026-10-01 09:00:00|Late\n0|a|b|c\n\nend\n",
+            "line 32: `task` must come before the mail",
+        ),
+        (
+            "\nend\n",
+            "\n1|late|in|out\nend\n",
+            "line 32: a test line must come before the mail",
+        ),
+        (
+            "\nend\n",
+            "\nnext|11\nend\n",
+            "line 32: `next` must come before the mail",
+        ),
+        (
             "\nend\n",
             "\n",
-            "line 28: no `end` line: the file is cut short",
+            "line 32: no `end` line: the file is cut short",
         ),
         (
             "\nend\n",
             "\nend|now\n",
-            "line 28: `end` takes no values after it, not 1",
+            "line 32: `end` takes no values after it, not 1",
         ),
-        ("\nend\n", "\nend\nend\n", "line 29: a line after `end`"),
+        ("\nend\n", "\nend\nend\n", "line 33: a line after `end`"),
     ];
 
     #[test]
@@ -1431,7 +1615,7 @@ mod tests {
         for (text, expected) in [
             (
                 "",
-                "line 1: not a full dump: its first line is `agent-kanban full dump 1`",
+                "line 1: not a full dump: its first line is `agent-kanban full dump 2`",
             ),
             (
                 "no tasks\n",
@@ -1460,9 +1644,26 @@ mod tests {
         let loose = FULL
             .replacen("agent|1|dev|", "agent|1| dev two |", 1)
             .replacen("|Someday", "|", 1);
-        for text in [tab, unnamed, loose] {
+        // Mail of a tab, and from no name at all: nothing `send` lets
+        // through, but what the table takes.
+        let mail =
+            FULL.replacen("||about a removed task", "||\t", 1)
+                .replacen("mail|gone|", "mail||", 1);
+        for text in [tab, unnamed, loose, mail] {
             assert_eq!(reread(&text), text);
         }
+    }
+
+    /// 0.4 wrote format 1: this format without mail. Such a file loads as it
+    /// always did, and is dumped again in the format of today.
+    #[test]
+    fn a_format_1_file_still_loads() {
+        let mail = FULL.find("\nmail|").unwrap()..FULL.rfind("\n\nend").unwrap() + 1;
+        let today = FULL.replacen(&FULL[mail], "", 1);
+        let format_1 = today.replacen("dump 2\n", "dump 1\n", 1);
+
+        assert_eq!(reread(&format_1), today);
+        assert!(today.ends_with("|Someday\nafter|1,4\n0|works|in|out\n\nend\n"));
     }
 
     #[test]
@@ -1474,14 +1675,26 @@ mod tests {
         let err = restore(&conn, &parse(EMPTY).unwrap(), false).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "the board is not empty (tasks 3, agents 2); `load --replace FILE` replaces it"
+            "the board is not empty (tasks 3, agents 2, mail 3); `load --replace FILE` replaces it"
         );
-        // Agents alone make a board that is not empty.
+        // Agents alone make a board that is not empty, and so does mail
+        // whose agents have all been removed.
         let agents_only = setup();
         agents_only
             .execute("INSERT INTO agents (name) VALUES ('dev')", [])
             .unwrap();
         assert!(restore(&agents_only, &board, false).is_err());
+        let mail_only = setup();
+        mail_only
+            .execute(
+                "INSERT INTO messages (sender, recipient, body) VALUES ('a', 'b', 'hi')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            restore(&mail_only, &board, false).unwrap_err().to_string(),
+            "the board is not empty (tasks 0, agents 0, mail 1); `load --replace FILE` replaces it"
+        );
 
         // Every row goes, whatever points at it: leases, history, edges.
         restore(&conn, &parse(EMPTY).unwrap(), true).unwrap();
@@ -1491,6 +1704,7 @@ mod tests {
             "task_deps",
             "acceptance_results",
             "review_history",
+            "messages",
         ] {
             let rows: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -1515,7 +1729,7 @@ mod tests {
         restore(&conn, &parse(FULL).unwrap(), true).unwrap();
         assert_eq!(last_id(&conn).unwrap(), 29);
         restore(&conn, &parse(EMPTY).unwrap(), true).unwrap();
-        assert_eq!(dumped(&conn), "agent-kanban full dump 1\nnext|30\n\nend\n");
+        assert_eq!(dumped(&conn), "agent-kanban full dump 2\nnext|30\n\nend\n");
         assert_eq!(next_id(&conn), 30);
 
         let fresh = setup();
@@ -1583,6 +1797,19 @@ mod tests {
         assert_eq!(
             read(&conn).err().unwrap().to_string(),
             "task 1 has a result's test that agent-kanban never writes (\"c\"); a full dump \
+             cannot keep it"
+        );
+
+        // An empty cell would come back as mail that waits to be read.
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO messages (sender, recipient, body, read_at) VALUES ('a', 'b', 'hi', '')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            read(&conn).err().unwrap().to_string(),
+            "a message has an empty read time, which agent-kanban never writes; a full dump \
              cannot keep it"
         );
     }

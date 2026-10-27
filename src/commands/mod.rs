@@ -3,6 +3,7 @@ pub mod deps;
 pub mod full_dump;
 pub mod guide;
 pub mod lifecycle;
+pub mod mail;
 pub mod skill;
 pub mod status;
 pub mod task;

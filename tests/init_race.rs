@@ -52,7 +52,7 @@ fn concurrent_init_in_a_fresh_directory_succeeds_everywhere_and_builds_the_schem
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4, "round {round}");
+        assert_eq!(version, 5, "round {round}");
         let tables: Vec<String> = conn
             .prepare(
                 "SELECT name FROM sqlite_master
@@ -68,6 +68,7 @@ fn concurrent_init_in_a_fresh_directory_succeeds_everywhere_and_builds_the_schem
             [
                 "acceptance_results",
                 "agents",
+                "messages",
                 "review_history",
                 "task_deps",
                 "tasks"

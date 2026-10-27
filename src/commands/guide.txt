@@ -18,4 +18,6 @@ BOARD
   show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
   dump: all tasks (done too) as show --history, a blank line apart; big board: dump > FILE
   dump --full > FILE: the whole board for git; load FILE [--replace] restores it
+MAIL
+  send NAME TEXT [--task ID] -> sent    inbox -> FROM|[#ID]|TEXT per new message, each shown once; or `no mail`
 In `|` lines \| \\ \n mean | \ and newline.

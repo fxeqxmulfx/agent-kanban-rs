@@ -27,9 +27,9 @@ impl Part {
     /// Headings of the sections this part is made of.
     const fn sections(self) -> &'static [&'static str] {
         match self {
-            Self::Developer => &["WORK", "DEVELOPER"],
-            Self::Reviewer => &["WORK", "REVIEWER"],
-            Self::Planning => &["PLANNING"],
+            Self::Developer => &["WORK", "DEVELOPER", "MAIL"],
+            Self::Reviewer => &["WORK", "REVIEWER", "MAIL"],
+            Self::Planning => &["PLANNING", "MAIL"],
             Self::Board => &["BOARD"],
         }
     }
@@ -205,6 +205,8 @@ mod tests {
                     "submit-review",
                     "--pass",
                     "release",
+                    "send NAME",
+                    "inbox",
                 ],
                 &[
                     "approve",
@@ -224,6 +226,8 @@ mod tests {
                     "|RESULT|EVIDENCE",
                     "approve",
                     "request-changes",
+                    "send NAME",
+                    "inbox",
                 ],
                 &[
                     "submit-review",
@@ -243,6 +247,8 @@ mod tests {
                     "remove ID",
                     "agent register",
                     "--after",
+                    "send NAME",
+                    "inbox",
                 ],
                 &[
                     "claim-next",
@@ -269,7 +275,14 @@ mod tests {
                     "load FILE",
                     "--replace",
                 ],
-                &["claim-next", "submit-review", "approve", "add --title"],
+                &[
+                    "claim-next",
+                    "submit-review",
+                    "approve",
+                    "add --title",
+                    "send NAME",
+                    "inbox",
+                ],
             ),
         ];
         for (part, present, absent) in cases {

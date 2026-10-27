@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 500 tokens, or about 200 for just one job's part).
+command (`agent-kanban guide`, about 540 tokens, or 210 to 260 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -146,18 +146,21 @@ BOARD
   show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
   dump: all tasks (done too) as show --history, a blank line apart; big board: dump > FILE
   dump --full > FILE: the whole board for git; load FILE [--replace] restores it
+MAIL
+  send NAME TEXT [--task ID] -> sent    inbox -> FROM|[#ID]|TEXT per new message, each shown once; or `no mail`
 In `|` lines \| \\ \n mean | \ and newline.
 ```
 
 An agent that does one job does not need the whole manual.
 `agent-kanban guide developer` (or `reviewer`, `planning`, `board`) prints just that part:
 the two opening lines and the closing escape rule, plus the sections of the job (`WORK` is
-shared by developers and reviewers). A part has no text of its own, only lines of the full
-manual in the same order, so it cannot drift from it. Measured (`o200k_base`):
+shared by developers and reviewers, `MAIL` by them and planning). A part has no text of its
+own, only lines of the full manual in the same order, so it cannot drift from it. Measured
+(`o200k_base`):
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 506 | 223 (−56%) | 199 (−61%) | 184 (−64%) | 206 (−59%) |
+| tokens | 541 | 258 (−52%) | 234 (−57%) | 219 (−60%) | 206 (−62%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
 280 tokens in every session of that agent.
@@ -188,7 +191,7 @@ again after upgrading `agent-kanban`.
 
 What it costs (`o200k_base`): the description that is in every session is 39 to 65 tokens
 depending on the skill, and the body, which is read only when the skill is used, is the
-guide's 184 to 506.
+guide's 206 to 541.
 
 ## Command reference
 
@@ -205,7 +208,7 @@ guide's 184 to 506.
 | `show ID [--history]` | header line and `\|` rows ([format](#task-replies)) | Everything about one task; what is empty is left out. `--history` adds every past revision with its results and the review decision. |
 | `dump` | `show ID --history` of every task, a blank line apart, or `no tasks` | [The whole board](#the-whole-board) in one reply: done tasks included, in id order, read as one consistent snapshot. On a big board write it to a file (`dump > board.txt`). |
 | `dump --full` | a [full dump](#keeping-the-board-in-git) | Everything the board holds, in the form `load` reads, to keep in git. One consistent snapshot. Refused if `load` would refuse what it printed. |
-| `load FILE [--replace]` | `loaded tasks N, agents M` | Fills an empty board from a `dump --full` file (`-` reads standard input); `--replace` replaces a board that is not empty. Checks the whole file, then writes it in one transaction. |
+| `load FILE [--replace]` | `loaded tasks N, agents M`, plus `, mail K` when there is mail | Fills an empty board from a `dump --full` file (`-` reads standard input); `--replace` replaces a board that is not empty. Checks the whole file, then writes it in one transaction. |
 | `claim ID [--agent A] [--lease SECS]` | work order (header line and `\|` rows) | A **developer** takes a `todo`, or an unclaimed/expired `in_progress`, task whose prerequisites are all done; it becomes `in_progress`. A **reviewer** takes a task in `review`; it stays in `review`. Claiming again as the holder renews the lease (default 3600 s). |
 | `claim-next [--agent A] [--lease SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. |
 | `submit-review ID [--agent A] (--pass IDX EVIDENCE \| --fail IDX EVIDENCE)...` | `#7 review rev1` | The developer holding the task gives exactly one verdict per test (index from 0) with non-empty evidence. Results, the new revision and the status change commit together. |
@@ -216,15 +219,17 @@ guide's 184 to 506.
 | `edit ID [--title T] [--priority P] [--tag X]... [--test D I O]... [--after IDS] [--drop-after IDS]` | `#7 STATUS` (plus `after:IDS`) | Updates an unclaimed task outside `review`/`done`. `--tag` and `--test` replace everything; `--after` adds prerequisites, `--drop-after` removes them. A task can never be edited down to zero tests. |
 | `remove ID` | `#7 removed` | Deletes an unclaimed task outside `review`/`done` that no other task waits for. Its id is never handed out again, so a stale `#7` finds "not found", never a different task. |
 | `status` | `backlog 0, todo 3, in_progress 1, review 0, done 5` | Adds `; blocked N` when `todo` tasks wait for prerequisites, and a second line `agents: alice 7,9; bob -` with the tasks each agent holds. |
+| `send NAME TEXT [--agent A] [--task ID]` | `sent` | Leaves a message for the agent NAME, about a task if `--task` says so. Sender and recipient must be registered, the text must not be empty and the task must exist. See [Mail between agents](#mail-between-agents). |
+| `inbox [--agent A]` | `FROM\|#ID\|TEXT` per new message, oldest first, or `no mail` | Prints the agent's unread mail and marks it read in the same transaction, so each message is printed once. `#ID` is empty for mail about no task. |
 
 Global flag: `--db <path>` uses that exact database file instead of discovering `.kanban/`
 by walking up from the current directory — useful for scripting against a specific project
 without `cd`-ing into it, or for keeping the database somewhere other than
 `.kanban/board.db`. It can go anywhere on the command line.
 
-Who is acting: the commands that claim or finish work take `--agent NAME` or read the
-`AGENT_KANBAN_AGENT` environment variable (the flag wins). Task ids are plain numbers;
-the `#7` spelling that replies use is accepted too.
+Who is acting: the commands that claim or finish work, and `send` and `inbox`, take
+`--agent NAME` or read the `AGENT_KANBAN_AGENT` environment variable (the flag wins). Task
+ids are plain numbers; the `#7` spelling that replies use is accepted too.
 
 ### Replies, errors and exit codes
 
@@ -298,7 +303,7 @@ submitted and their results in the history, it is about 78,000 tokens (`o200k_ba
 takes 0.04 s with a release build. On a big board, write it to a file and let the agent read
 or search that; an agent's shell tool may also cut long output short.
 
-A dump is for reading and cannot be loaded back: it leaves out the agent list, times, lease
+A dump is for reading and cannot be loaded back: it leaves out the agent list, mail, times, lease
 ends, dependencies on done tasks and the id counter. For a copy that can, see the next
 section.
 
@@ -318,16 +323,17 @@ git show HEAD~3:kanban.txt | agent-kanban load --replace -   # the board three c
 A full dump leaves nothing out: agents and their roles, the times, leases (a task that was
 held is held by the same agent until the same moment), every dependency including those on
 done tasks, the test each result judged when that test has changed since, the names of
-removed agents in the history, and the id counter. A board loaded from it has the same rows
+removed agents in the history, the mail, read or not, and the id counter. A board loaded from it has the same rows
 in every table as the board it came from (only the history rows' own ids, which nothing
 reads, are numbered afresh), so every command replies as it did there and work in progress
 carries on. Its lines come in a fixed order, so a change to the board changes only its own
 lines: a claim rewrites the task's line and adds a `lease` line, a submission rewrites it
-again, drops the `lease` line and adds a `result` line per test, a new task adds a block at
-the end and bumps `next`.
+again, drops the `lease` line and adds a `result` line per test, a new task adds a block
+after the last one and bumps `next`, and a message adds a `mail` line that `inbox` later
+fills in with the time it was read.
 
 ```text
-agent-kanban full dump 1
+agent-kanban full dump 2
 next|3
 agent|1|alice|developer|2026-10-01 09:00:00
 agent|2|bob|reviewer|2026-10-01 09:00:05
@@ -344,14 +350,19 @@ after|1
 result|1|0|failed|panics on an empty key|1|alice|2026-10-01 09:55:00
 review|1|changes_requested|handle the empty-key case|2|bob|2026-10-01 10:05:00
 
+mail|alice|bob|2|2026-10-01 10:20:00|2026-10-01 10:21:00|per IP or per user?
+mail|bob|alice|2|2026-10-01 10:22:00||per IP
+
 end
 ```
 
 `agent` is `ID|NAME|ROLE|CREATED`; `task` is `ID|PRIORITY|STATUS|REVISION|CREATED|UPDATED|TITLE`;
 `lease` is `AGENT|CLAIMED|EXPIRES`; `result` is `REVISION|TEST|RESULT|EVIDENCE|AGENT|NAME|AT`,
 followed by the test it judged if that test has changed since; `review` is
-`REVISION|DECISION|NOTES|AGENT|NAME|AT`. AGENT is an agent's id, empty once the agent is
-removed. Times are UTC. Cells are escaped as in every reply.
+`REVISION|DECISION|NOTES|AGENT|NAME|AT`; `mail` is `FROM|TO|TASK|SENT|READ|TEXT`, oldest
+first, with TASK empty for mail about no task and READ for mail not read yet. AGENT is an
+agent's id, empty once the agent is removed. Times are UTC. Cells are escaped as in every
+reply.
 
 What `load` guarantees:
 
@@ -365,6 +376,9 @@ What `load` guarantees:
 * **What was printed loads.** `dump --full` checks its own text as `load` would and refuses
   to print a board that `load` would not take back (only a database edited by hand holds
   one), so the file in git does not fail on the day it is needed.
+* **Older files load.** The first line names the format. 0.4 wrote format 1, which has no
+  mail, and its files load as they always did; a file from a newer build is refused with
+  `upgrade agent-kanban`.
 
 Branches that changed different tasks merge cleanly, say a claim on one and a new task on
 the other. Boards on two machines hand out the same new ids, though, so tasks added on both
@@ -403,6 +417,31 @@ error: task 3 is a prerequisite of 5,6; remove those tasks or detach them (edit 
 * A task other tasks still wait for cannot be removed
   (the error names the dependents); removing a task drops its own edges.
 
+## Mail between agents
+
+Agents that share a board often have no other way to reach each other. `send` leaves a
+message on the board for an agent, by name, and `inbox` hands an agent its new messages:
+
+```sh
+$ agent-kanban send bob "Is the limit per IP or per user?" --task 2 --agent alice
+sent
+$ agent-kanban inbox --agent bob
+alice|#2|Is the limit per IP or per user?
+$ agent-kanban inbox --agent bob
+no mail
+```
+
+* `inbox` prints each message once, oldest first, and marks it read in the same
+  transaction, so two processes reading one inbox at once never both get a message. Mail
+  about no task reads `alice||TEXT`; text is escaped like every cell (a newline is `\n`).
+* Both ends must be registered agents, so a misspelt name is refused instead of mail
+  going nowhere, and a lead who wants answers registers a name too (`agent register lead`).
+* Mail is kept by name. It survives `agent remove`, and mail for a removed agent waits
+  until the name is registered again. A message about a task keeps its `#7` after the task
+  is removed; ids are never reused, so it never comes to name another task.
+* Nothing announces new mail yet: an agent sees it when it calls `inbox`. Read mail stays
+  on the board and in [`dump --full`](#keeping-the-board-in-git).
+
 ## Concurrency model
 
 `agent-kanban` stores its state in a single SQLite database (`.kanban/board.db`) opened in
@@ -415,7 +454,7 @@ locking.
 
 Status and ownership are independent columns. Every command that changes state
 (`claim`, `claim-next`, `submit-review`, `approve`, `request-changes`, `release`,
-`move`, `edit`, `remove`, `agent remove`) runs in **one `IMMEDIATE` transaction** in which
+`move`, `edit`, `remove`, `agent remove`, `send`, `inbox`) runs in **one `IMMEDIATE` transaction** in which
 the preconditions (role, status, current owner, lease expiry, prerequisites) are checked
 and the change is written. Nothing can change between the check and the write, so exactly
 one of several contenders wins, and the loser's error describes the state it really lost
@@ -475,7 +514,7 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 500 tokens; one job's part about 180–225) replaces
+with one call, and `guide` (about 540 tokens; one job's part about 210–260) replaces
 reading the `--help` screens (about 2,300 tokens in total).
 
 The scenario's board is small. Output that grows with the board is the one cost nothing
@@ -513,6 +552,15 @@ the shell already gives you what is needed, so `agent-kanban` has no flags for i
 
 * **Say who you are once.** Whoever starts an agent can `export AGENT_KANBAN_AGENT=alice`;
   from then on no command needs `--agent NAME`.
+
+## Upgrading from 0.4
+
+The board schema becomes v5, which adds the table that holds [mail](#mail-between-agents).
+The first command of the new build upgrades a board in place and keeps everything on it.
+0.4 cannot open a board after that (`error: this project's schema version (5) is newer than
+this build of agent-kanban supports (4); upgrade agent-kanban`), so upgrade every agent that
+shares the board together. `dump --full` now writes format 2, which 0.4 cannot load; the
+files 0.4 wrote still load.
 
 ## Upgrading from 0.3
 

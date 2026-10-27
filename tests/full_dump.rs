@@ -69,7 +69,8 @@ fn rows(dir: &Path) -> Vec<String> {
 /// it worked and its name registered again, a done task, a task sent back
 /// and claimed again (a live lease), a lease that ran out, a test changed
 /// after it was judged, edges to done and open tasks, tags, text that needs
-/// escaping and a removed task.
+/// escaping, a removed task, and mail: read and not, about a task that was
+/// removed since, from and to the agent that was removed.
 fn board_of_every_kind() -> TempDir {
     let dir = initialized();
     register(&dir, "dev", "developer");
@@ -105,6 +106,10 @@ fn board_of_every_kind() -> TempDir {
     add_task_after(&dir, "Follow-up", &[2]);
     add_task(&dir, "Someday", "low");
     run(&dir, &["move", "5", "backlog"]);
+    as_agent(
+        "rev",
+        &["send", "dev", "is #3 still needed?", "--task", "3"],
+    );
     run(&dir, &["remove", "3"]);
     add_task(&dir, "Held, then left", "urgent");
     add_task(&dir, "Rework", "high");
@@ -144,12 +149,22 @@ fn board_of_every_kind() -> TempDir {
     as_agent("temp", &["submit-review", "7", "--pass", "0", "by temp"]);
     as_agent("rev", &["claim", "7"]);
     as_agent("rev", &["request-changes", "7", "--notes", "redo"]);
+    as_agent("rev", &["send", "temp", "see my notes", "--task", "7"]);
+    as_agent(
+        "temp",
+        &["send", "dev", "I may not finish #7", "--task", "7"],
+    );
     run(&dir, &["agent", "remove", "temp"]);
     register(&dir, "temp", "developer");
     run(&dir, &["edit", "7", "--test", "works better", "in", "out2"]);
 
     as_agent("dev", &["claim", "6"]);
     expire_lease(&dir, 6);
+    as_agent("dev", &["inbox"]);
+    as_agent(
+        "dev",
+        &["send", "rev", "Feature | X\nis ready", "--task", "2"],
+    );
     dir
 }
 
@@ -161,7 +176,7 @@ fn a_board_loaded_from_its_full_dump_is_the_same_board() {
 
     assert_eq!(
         run(&new, &["load", path(&file)]),
-        "loaded tasks 6, agents 3"
+        "loaded tasks 6, agents 3, mail 4"
     );
 
     assert_eq!(rows(new.path()), rows(old.path()));
@@ -171,6 +186,11 @@ fn a_board_loaded_from_its_full_dump_is_the_same_board() {
         &["list", "--all"],
         &["status"],
         &["agent", "list"],
+        // Mail that waited on the old board waits on the new one, once.
+        &["inbox", "--agent", "rev"],
+        &["inbox", "--agent", "temp"],
+        &["inbox", "--agent", "dev"],
+        &["inbox", "--agent", "rev"],
     ] {
         assert_eq!(run(&new, args), run(&old, args), "{args:?}");
     }
@@ -186,8 +206,30 @@ fn a_full_dump_keeps_what_a_dump_for_reading_leaves_out() {
     let full = run(&dir, &["dump", "--full"]);
 
     let lines: Vec<&str> = full.lines().collect();
-    assert_eq!(lines[..2], ["agent-kanban full dump 1", "next|8"]);
+    assert_eq!(lines[..2], ["agent-kanban full dump 2", "next|8"]);
     assert_eq!(lines.last(), Some(&"end"));
+    // Mail in the order it was sent, read or not; `inbox` shows none of
+    // the times, nor whom a message was for.
+    let mail: Vec<Vec<String>> = lines
+        .iter()
+        .filter(|line| line.starts_with("mail|"))
+        .map(|line| common::split_cells(line))
+        .collect();
+    let shape: Vec<[&str; 4]> = mail
+        .iter()
+        .map(|cells| [&cells[1], &cells[2], &cells[3], &cells[6]].map(String::as_str))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ["rev", "dev", "3", "is #3 still needed?"],
+            ["rev", "temp", "7", "see my notes"],
+            ["temp", "dev", "7", "I may not finish #7"],
+            ["dev", "rev", "2", "Feature | X\nis ready"],
+        ]
+    );
+    let read: Vec<bool> = mail.iter().map(|cells| !cells[5].is_empty()).collect();
+    assert_eq!(read, [true, false, true, false], "{full}");
     for line in [
         "after|2",
         r"tags|api|needs\\review",
@@ -233,9 +275,25 @@ fn load_fills_an_empty_board_and_replaces_one_only_when_told() {
 
     assert_eq!(
         run(&other, &["load", "--replace", path(&file)]),
-        "loaded tasks 6, agents 3"
+        "loaded tasks 6, agents 3, mail 4"
     );
     assert_eq!(rows(other.path()), rows(old.path()));
+}
+
+/// 0.4 wrote format 1, which has no mail: its files load as they always did.
+#[test]
+fn a_file_from_0_4_still_loads() {
+    let format_1 = "agent-kanban full dump 1\nnext|3\nagent|1|dev|developer|2026-10-01 09:00:00\n\n\
+                    task|2|low|todo|0|2026-10-01 09:01:00|2026-10-01 09:01:00|Old\n0|d|i|o\n\nend\n";
+    let dir = initialized();
+    fs::write(dir.path().join("old.txt"), format_1).unwrap();
+
+    assert_eq!(run(&dir, &["load", "old.txt"]), "loaded tasks 1, agents 1");
+
+    assert_eq!(
+        run(&dir, &["dump", "--full"]),
+        format_1.replacen("dump 1", "dump 2", 1).trim_end()
+    );
 }
 
 /// The whole file is checked before anything is written, so a bad line
@@ -300,7 +358,7 @@ fn files_that_are_not_a_full_dump_are_refused() {
     }
     assert_eq!(
         run(&new, &["dump", "--full"]),
-        "agent-kanban full dump 1\nnext|1\n\nend"
+        "agent-kanban full dump 2\nnext|1\n\nend"
     );
 }
 
@@ -317,7 +375,7 @@ fn a_dash_reads_the_file_from_standard_input() {
         .unwrap();
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"loaded tasks 6, agents 3\n");
+    assert_eq!(output.stdout, b"loaded tasks 6, agents 3, mail 4\n");
     assert_eq!(rows(new.path()), rows(old.path()));
 }
 

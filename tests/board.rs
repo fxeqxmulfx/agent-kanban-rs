@@ -902,7 +902,7 @@ fn init_stamps_the_current_schema_version() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
 
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert!(common::db_path(&dir).is_file());
 }
 
@@ -971,7 +971,7 @@ fn a_newer_schema_is_refused_instead_of_misread() {
         .execute_batch("PRAGMA user_version = 999;")
         .unwrap();
 
-    let message = "error: this project's schema version (999) is newer than this build of agent-kanban supports (4); upgrade agent-kanban";
+    let message = "error: this project's schema version (999) is newer than this build of agent-kanban supports (5); upgrade agent-kanban";
     assert_eq!(fail(&dir, &["agent", "list"]), message);
     assert_eq!(fail(&dir, &["init"]), message);
 }

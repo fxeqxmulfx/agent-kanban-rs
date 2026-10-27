@@ -284,6 +284,27 @@ enum Command {
 
     /// Counts per status, and the tasks each agent holds
     Status,
+
+    /// Leave a message for another agent, who reads it with `inbox`
+    Send {
+        /// The agent it is for
+        #[arg(value_name = "NAME")]
+        to: String,
+        /// The message
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        /// The task it is about
+        #[arg(long, value_parser = parse_id, value_name = "ID")]
+        task: Option<i64>,
+        #[command(flatten)]
+        who: Who,
+    },
+
+    /// Print your new messages, oldest first; each is shown once
+    Inbox {
+        #[command(flatten)]
+        who: Who,
+    },
 }
 
 #[derive(Subcommand)]
@@ -403,6 +424,13 @@ fn run(command: Command) -> Result<String> {
             lifecycle::request_changes(id, who.name()?, &notes)
         }
         Command::Release { id, who } => lifecycle::release(id, who.name()?),
+        Command::Send {
+            to,
+            text,
+            task,
+            who,
+        } => commands::mail::send(who.name()?, &to, &text, task),
+        Command::Inbox { who } => commands::mail::inbox(who.name()?),
     }
 }
 
