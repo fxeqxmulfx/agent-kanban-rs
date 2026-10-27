@@ -205,6 +205,7 @@ mod tests {
                     "submit-review",
                     "--pass",
                     "release",
+                    "--wait SECS",
                 ],
                 &[
                     "approve",
@@ -224,6 +225,7 @@ mod tests {
                     "|RESULT|EVIDENCE",
                     "approve",
                     "request-changes",
+                    "--wait SECS",
                 ],
                 &[
                     "submit-review",
@@ -243,6 +245,7 @@ mod tests {
                     "remove ID",
                     "agent register",
                     "--after",
+                    "wait IDS",
                 ],
                 &[
                     "claim-next",

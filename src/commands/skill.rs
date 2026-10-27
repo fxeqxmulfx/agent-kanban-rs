@@ -26,25 +26,28 @@ const fn name(part: Option<Part>) -> &'static str {
 const fn description(part: Option<Part>) -> &'static str {
     match part {
         None => {
-            "Use the agent-kanban task board. Claim the next task, hand it in for review with \
-             evidence, review the work of other agents, plan tasks and dependencies, inspect, \
-             dump or restore the board. Use when the project has a .kanban directory or when \
-             asked to pick up, review, plan or list tasks."
+            "Use the agent-kanban task board. Claim the next task, hand it in with evidence, \
+             review the work of other agents, message them, plan tasks and wait for them, \
+             inspect, dump or restore the board. Use when the project has a .kanban directory \
+             or when asked to pick up, review, plan or list tasks."
         }
         Some(Part::Developer) => {
-            "Do tasks from the agent-kanban board as a developer. Claim the next task, work on \
-             it, hand it in for review with test evidence and release it if stuck. Use when the \
-             project has a .kanban directory or when asked to pick up the next task."
+            "Do tasks from the agent-kanban board as a developer. Claim the next task or wait \
+             for one, work on it, hand it in for review with test evidence, release it if stuck \
+             and message other agents. Use when the project has a .kanban directory or when \
+             asked to pick up the next task."
         }
         Some(Part::Reviewer) => {
             "Review tasks on the agent-kanban board as a reviewer. Claim the next task in \
-             review, check it against its tests, then approve it or request changes. Use when \
-             the project has a .kanban directory or when asked to review work."
+             review or wait for one, check it against its tests, then approve it or request \
+             changes, and message other agents. Use when the project has a .kanban directory or \
+             when asked to review work."
         }
         Some(Part::Planning) => {
             "Plan work on the agent-kanban board. Add, edit, prioritize, order (with \
-             dependencies) and remove tasks and register agents. Use when asked to create or \
-             organize tasks on the board."
+             dependencies) and remove tasks, register agents, wait until tasks are done and \
+             message agents. Use when asked to create or organize tasks on the board or to wait \
+             for them."
         }
         Some(Part::Board) => {
             "Look at the agent-kanban board. List, show and dump tasks, see the status counts, \

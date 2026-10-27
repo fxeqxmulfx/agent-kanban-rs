@@ -171,6 +171,10 @@ enum Command {
         who: Who,
         #[command(flatten)]
         lease: Lease,
+        /// While there is nothing to claim, keep looking for up to SECS
+        /// seconds; stops early when mail comes
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u32>,
     },
 
     /// Hand finished work to a reviewer
@@ -305,6 +309,24 @@ enum Command {
         #[command(flatten)]
         who: Who,
     },
+
+    /// Wait until the tasks are done, or mail comes for --agent; print their
+    /// `list` lines
+    Wait {
+        /// The tasks to wait for (comma-separated or repeated)
+        #[arg(
+            required = true,
+            value_delimiter = ',',
+            value_parser = parse_id,
+            value_name = "IDS"
+        )]
+        ids: Vec<i64>,
+        /// Stop after SECS seconds even if not all are done
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u32>,
+        #[command(flatten)]
+        who: Who,
+    },
 }
 
 impl Command {
@@ -319,7 +341,8 @@ impl Command {
             | Self::Approve { who, .. }
             | Self::RequestChanges { who, .. }
             | Self::Release { who, .. }
-            | Self::Send { who, .. } => Some(who),
+            | Self::Send { who, .. }
+            | Self::Wait { who, .. } => Some(who),
             Self::Inbox { .. }
             | Self::Init
             | Self::Guide { .. }
@@ -451,7 +474,9 @@ fn dispatch(command: Command) -> Result<String> {
         Command::Status => commands::status::status(),
         Command::Move { id, status } => lifecycle::move_status(id, &status),
         Command::Claim { id, who, lease } => lifecycle::claim(id, who.name()?, lease.lease),
-        Command::ClaimNext { who, lease } => lifecycle::claim_next(who.name()?, lease.lease),
+        Command::ClaimNext { who, lease, wait } => {
+            lifecycle::claim_next(who.name()?, lease.lease, wait.unwrap_or(0))
+        }
         Command::SubmitReview {
             id,
             who,
@@ -474,6 +499,7 @@ fn dispatch(command: Command) -> Result<String> {
             who,
         } => commands::mail::send(who.name()?, &to, &text, task),
         Command::Inbox { who } => commands::mail::inbox(who.name()?),
+        Command::Wait { ids, timeout, who } => commands::wait::wait(&ids, timeout, who.name().ok()),
     }
 }
 

@@ -26,7 +26,7 @@ pub fn noted(reply: String, me: &str) -> String {
     }
 }
 
-fn unread(conn: &Connection, me: &str) -> Result<i64> {
+pub(super) fn unread(conn: &Connection, me: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
         [me],

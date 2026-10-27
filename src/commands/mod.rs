@@ -8,6 +8,7 @@ pub mod skill;
 pub mod status;
 pub mod task;
 pub mod view;
+pub mod wait;
 
 use anyhow::Result;
 

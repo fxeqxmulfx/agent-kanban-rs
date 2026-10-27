@@ -222,11 +222,11 @@ fn the_list_help_states_the_default_limit() {
 }
 
 /// Every agent reads the guide at the start of every session, so its size is
-/// part of the design, not an accident.
+/// part of the design, not an accident. (2,000 until mail and `--wait` came.)
 #[test]
 fn the_guide_stays_short() {
     assert!(
-        GUIDE.len() <= 2_000,
+        GUIDE.len() <= 2_200,
         "the guide grew to {} bytes",
         GUIDE.len()
     );

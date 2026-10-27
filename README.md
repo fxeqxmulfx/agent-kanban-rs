@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 560 tokens, or 210 to 280 for just one job's part).
+command (`agent-kanban guide`, about 610 tokens, or 210 to 300 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -131,6 +131,7 @@ Say who you are with --agent NAME or env AGENT_KANBAN_AGENT. Ids are numbers (re
 WORK
   claim-next -> #7 [rev2] TITLE, changes|NOTES (rework only), then a line per test: IDX|DESCRIBE|INPUT|OUTPUT (a reviewer's lines end |RESULT|EVIDENCE); or `idle` (`idle, N open`: tasks exist but are held, blocked or in review)
   claim ID: the same for one task. Claiming again renews the lease (--lease SECS, default 3600).
+  claim-next --wait SECS waits up to SECS for work or mail; run long waits in the background
 DEVELOPER
   submit-review ID --pass IDX EVIDENCE | --fail IDX EVIDENCE   one per test -> #7 review rev1
   changes = the reviewer's notes from a rejection: fix, submit again. release ID gives a task back.
@@ -141,6 +142,7 @@ PLANNING
   edit ID [same flags, --tag/--test replace all] [--drop-after IDS]   only unclaimed tasks outside review/done
   move ID backlog|todo    remove ID    agent register NAME [--role developer|reviewer]
   --after IDS: tasks that must be done first (a DAG, cycles refused); developers cannot claim before that.
+  wait IDS [--timeout SECS] -> their list lines once all are done, or on mail for --agent; run long waits in the background
 BOARD
   list [--status S] [--tag T] [--executor NAME] [--priority P] [--all] [--limit N] -> `#7 high in_progress@alice after:3 Title`; done hidden without --all
   show ID [--history]   status   agent list|remove NAME   init   guide|skill [developer|reviewer|planning|board]   --db PATH
@@ -161,10 +163,10 @@ own, only lines of the full manual in the same order, so it cannot drift from it
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 558 | 275 (−51%) | 251 (−55%) | 236 (−58%) | 206 (−63%) |
+| tokens | 614 | 299 (−51%) | 275 (−55%) | 268 (−56%) | 206 (−66%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
-280 tokens in every session of that agent.
+310 tokens in every session of that agent.
 
 ## As a Claude Code skill
 
@@ -190,9 +192,9 @@ need, not both, since they describe the same commands. The body is exactly what 
 `guide reviewer`, ...) prints, so the two cannot disagree; the file is a copy, so save it
 again after upgrading `agent-kanban`.
 
-What it costs (`o200k_base`): the description that is in every session is 39 to 65 tokens
+What it costs (`o200k_base`): the description that is in every session is 52 to 68 tokens
 depending on the skill, and the body, which is read only when the skill is used, is the
-guide's 206 to 558.
+guide's 206 to 614.
 
 ## Command reference
 
@@ -211,7 +213,7 @@ guide's 206 to 558.
 | `dump --full` | a [full dump](#keeping-the-board-in-git) | Everything the board holds, in the form `load` reads, to keep in git. One consistent snapshot. Refused if `load` would refuse what it printed. |
 | `load FILE [--replace]` | `loaded tasks N, agents M`, plus `, mail K` when there is mail | Fills an empty board from a `dump --full` file (`-` reads standard input); `--replace` replaces a board that is not empty. Checks the whole file, then writes it in one transaction. |
 | `claim ID [--agent A] [--lease SECS]` | work order (header line and `\|` rows) | A **developer** takes a `todo`, or an unclaimed/expired `in_progress`, task whose prerequisites are all done; it becomes `in_progress`. A **reviewer** takes a task in `review`; it stays in `review`. Claiming again as the holder renews the lease (default 3600 s). |
-| `claim-next [--agent A] [--lease SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. |
+| `claim-next [--agent A] [--lease SECS] [--wait SECS]` | work order, `idle` or `idle, N open` | Atomically claims the best task for the caller's role: the task it already holds first, then `in_progress` before `todo`, then priority (urgent first), then lowest id; never a task with unfinished prerequisites. Calling it again returns the task you already hold. `idle, N open` means tasks exist that are held by others, blocked, or (for developers) waiting in review. `--wait SECS`: while there is nothing to claim, looks again every second for up to SECS seconds, and stops early when mail waits for the agent ([Fewer turns](#fewer-turns)). |
 | `submit-review ID [--agent A] (--pass IDX EVIDENCE \| --fail IDX EVIDENCE)...` | `#7 review rev1` | The developer holding the task gives exactly one verdict per test (index from 0) with non-empty evidence. Results, the new revision and the status change commit together. |
 | `approve ID [--agent A] [--notes T]` | `#7 done` or `#7 done unblocked:9,12` | The reviewer holding the task approves; refused while any test of the current revision failed. `unblocked` lists dependents that can start now. |
 | `request-changes ID [--agent A] --notes T` | `#7 in_progress` | The reviewer sends the task back with required changes; ownership is cleared. |
@@ -222,6 +224,7 @@ guide's 206 to 558.
 | `status` | `backlog 0, todo 3, in_progress 1, review 0, done 5` | Adds `; blocked N` when `todo` tasks wait for prerequisites, and a second line `agents: alice 7,9; bob -` with the tasks each agent holds. |
 | `send NAME TEXT [--agent A] [--task ID]` | `sent` | Leaves a message for the agent NAME, about a task if `--task` says so. Sender and recipient must be registered, the text must not be empty and the task must exist. See [Mail between agents](#mail-between-agents). |
 | `inbox [--agent A]` | `FROM\|#ID\|TEXT` per new message, oldest first, or `no mail` | Prints the agent's unread mail and marks it read in the same transaction, so each message is printed once. `#ID` is empty for mail about no task. |
+| `wait IDS [--timeout SECS] [--agent A]` | one `list` line per task | Waits until every task in IDS is done, looking once a second, and prints their lines in `list` order. Named by `--agent` (or the environment), it also ends as soon as mail waits for that agent. With `--timeout` it ends after SECS seconds, and the lines show how far the work got. A task that is or becomes missing (removed) is an error. It only reads, so waiting never holds anyone up. |
 
 Global flag: `--db <path>` uses that exact database file instead of discovering `.kanban/`
 by walking up from the current directory — useful for scripting against a specific project
@@ -229,10 +232,11 @@ without `cd`-ing into it, or for keeping the database somewhere other than
 `.kanban/board.db`. It can go anywhere on the command line.
 
 Who is acting: the commands that claim or finish work, and `send` and `inbox`, take
-`--agent NAME` or read the `AGENT_KANBAN_AGENT` environment variable (the flag wins). While
-mail waits for that agent, the reply of each of them but `inbox` ends with a line `mail|N`
-(N unread messages; see [Mail between agents](#mail-between-agents)). Task ids are plain
-numbers; the `#7` spelling that replies use is accepted too.
+`--agent NAME` or read the `AGENT_KANBAN_AGENT` environment variable (the flag wins); `wait`
+takes it too, but only to watch for mail. While mail waits for that agent, the reply of each
+of them but `inbox` ends with a line `mail|N` (N unread messages; see
+[Mail between agents](#mail-between-agents)). Task ids are plain numbers; the `#7` spelling
+that replies use is accepted too.
 
 ### Replies, errors and exit codes
 
@@ -444,8 +448,8 @@ no mail
   is removed; ids are never reused, so it never comes to name another task.
 * Nobody has to ask for news. While mail waits for an agent, the reply to each of its
   commands that name it (`claim`, `claim-next`, `submit-review`, `approve`,
-  `request-changes`, `release`, `send`) ends with a line `mail|N`, N being the number of
-  unread messages, until `inbox` shows them:
+  `request-changes`, `release`, `send`, `wait`) ends with a line `mail|N`, N being the
+  number of unread messages, until `inbox` shows them:
 
   ```sh
   $ agent-kanban send alice "Per IP" --task 2 --agent bob
@@ -458,9 +462,11 @@ no mail
   bob|#2|Per IP
   ```
 
-  Commands that name nobody (`list`, `show`, `status`, ...) do not count anyone's mail; a
-  lead who only plans calls `inbox` now and then. The note comes from a second look at the
-  board after the command is done, so if that look fails the reply simply has no note.
+  A wait ends as soon as mail comes, both `claim-next --wait` and `wait IDS --agent NAME`,
+  so a lead waiting for results still hears a question at once. Commands that name nobody
+  (`list`, `show`, `status`, ...) do not count anyone's mail. The note comes from a second
+  look at the board after the command is done, so if that look fails the reply simply has
+  no note.
 * Read mail stays on the board and in [`dump --full`](#keeping-the-board-in-git).
 
 ## Concurrency model
@@ -535,7 +541,7 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 560 tokens; one job's part about 210–280) replaces
+with one call, and `guide` (about 610 tokens; one job's part about 210–300) replaces
 reading the `--help` screens (about 2,300 tokens in total).
 
 The scenario's board is small. Output that grows with the board is the one cost nothing
@@ -549,8 +555,7 @@ every question through filters (`--status`, `--tag`, `--priority`, `--executor`)
 ### Fewer turns
 
 What an agent pays for is often not the words of a command but the *turn* it takes: every
-call makes the model read the conversation so far again. Fewer calls beat shorter calls, and
-the shell already gives you what is needed, so `agent-kanban` has no flags for it:
+call makes the model read the conversation so far again. Fewer calls beat shorter calls:
 
 * **Chain with `&&`.** Hand work in and take the next task in one call. If the first command
   is refused the chain stops and nothing is claimed:
@@ -559,17 +564,30 @@ the shell already gives you what is needed, so `agent-kanban` has no flags for i
   agent-kanban submit-review 7 --pass 0 "cargo test: ok" && agent-kanban claim-next
   ```
 
-* **Wait with a bounded loop** when `claim-next` says `idle`, instead of one call per poll.
-  This one asks every 20 seconds, five times; it prints the work order as soon as there is
-  one, or the last `idle`, and it ends at once on new mail (`idle` then `mail|N`) or on an
-  error such as an unregistered agent, whose `error: ...` goes to stderr as usual:
+* **Wait in one call** when `claim-next` says `idle`, instead of one call per look.
+  `--wait SECS` keeps looking, once a second, for up to SECS seconds. The reply is the work
+  order as soon as a task can be claimed, `idle` then `mail|N` as soon as mail waits, or the
+  last `idle` when the time is up; an error such as an unregistered agent ends it at once:
 
   ```sh
-  for i in $(seq 5); do o=$(agent-kanban claim-next); case "$o" in *'mail|'*) break;; idle*) sleep 20;; *) break;; esac; done; echo "$o"
+  agent-kanban claim-next --wait 100
   ```
 
-  Keep the total (about 100 s here) below the command time limit of whatever runs the agent
-  (two minutes by default in Claude Code), and call it again if it still says `idle`.
+  Keep SECS below the command time limit of whatever runs the agent (two minutes by default
+  in Claude Code), or run a long wait in the background: Claude Code wakes the agent when a
+  background command ends, so a long wait costs about two calls.
+
+* **Wait for results in one call**, instead of asking `show` again and again. Whoever hands
+  out tasks waits until all of them are done, and also hears its mail if it names itself:
+
+  ```sh
+  agent-kanban wait 3,5 --agent lead
+  ```
+
+  It prints the tasks' `list` lines once both are done (`#3 high done ...`), or the lines
+  then `mail|N` as soon as a worker writes to `lead`. `--timeout SECS` ends it sooner; the
+  lines then show how far the work got. Without `--timeout` it waits as long as it takes, so
+  run it in the background.
 
 * **Say who you are once.** Whoever starts an agent can `export AGENT_KANBAN_AGENT=alice`;
   from then on no command needs `--agent NAME`.

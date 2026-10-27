@@ -13,14 +13,20 @@
 //! first, so what a command checked is still true when it writes, and a
 //! refusal can say exactly why.
 
+use std::thread;
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 
 use super::agent::Role;
-use super::{deps, view};
+use super::{deps, mail, view};
 
 pub const DEFAULT_LEASE_SECONDS: u32 = 3600;
+
+/// How often `claim-next --wait` looks again.
+const WAIT_POLL: Duration = Duration::from_secs(1);
 
 /// Run `f` inside one `IMMEDIATE` transaction, committed if `f` succeeds.
 pub(super) fn write<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -207,11 +213,33 @@ fn why_not_claimed(conn: &Connection, id: i64, agent: &Agent) -> Result<String> 
     ))
 }
 
-/// `claim-next` -> the work order of the best task this agent can take, or
-/// `idle`. The pick and the claim are one statement, so concurrent agents
-/// never get the same task.
-pub fn claim_next(agent: &str, lease_seconds: u32) -> Result<String> {
-    write(|conn| claim_next_inner(conn, agent, lease_seconds))
+/// `claim-next [--wait SECS]` -> the work order of the best task this agent
+/// can take, or `idle`. The pick and the claim are one statement, so
+/// concurrent agents never get the same task.
+///
+/// With `--wait`, an idle agent looks again every second for up to
+/// `wait_seconds` and stops as soon as it gets work or mail waits for it.
+/// Each look is its own transaction and nothing is held between looks, so
+/// waiting agents never get in anyone's way, and of several waiting for one
+/// new task exactly one gets it while the others wait on.
+pub fn claim_next(agent: &str, lease_seconds: u32, wait_seconds: u32) -> Result<String> {
+    let deadline = Instant::now() + Duration::from_secs(u64::from(wait_seconds));
+    loop {
+        let (reply, idle_without_mail) = write(|conn| look(conn, agent, lease_seconds))?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if !idle_without_mail || left.is_zero() {
+            return Ok(reply);
+        }
+        thread::sleep(left.min(WAIT_POLL));
+    }
+}
+
+/// One `claim-next`: its reply, and whether it found the agent idle with no
+/// mail waiting, the only case in which `--wait` looks again.
+fn look(conn: &Connection, name: &str, lease_seconds: u32) -> Result<(String, bool)> {
+    let reply = claim_next_inner(conn, name, lease_seconds)?;
+    let idle = reply.starts_with("idle");
+    Ok((reply, idle && mail::unread(conn, name)? == 0))
 }
 
 fn claim_next_inner(conn: &Connection, name: &str, lease_seconds: u32) -> Result<String> {

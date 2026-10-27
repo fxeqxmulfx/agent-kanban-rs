@@ -207,6 +207,19 @@ fn list_inner(conn: &Connection, filter: &ListFilter) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+/// The `list` rows of the tasks `ids`, done or not, in `list` order. An id
+/// that names no task has no row.
+pub(super) fn rows_of(conn: &Connection, ids: &[i64]) -> Result<Vec<view::Row>> {
+    let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+    let scope = Scope {
+        matching: format!("t.id IN ({})", ids.join(",")),
+        visible: "1".to_string(),
+        hides_done: false,
+        params: Vec::new(),
+    };
+    rows(conn, &scope, 0)
+}
+
 /// The rows to print, most actionable first; `limit` 0 means all of them.
 fn rows(conn: &Connection, scope: &Scope, limit: usize) -> Result<Vec<view::Row>> {
     let limit = if limit == 0 {
