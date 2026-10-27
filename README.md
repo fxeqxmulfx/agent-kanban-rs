@@ -15,7 +15,7 @@ under real multi-process contention.
 It is also built to be cheap to talk to. An agent pays for every token it reads and
 writes, so replies are a few plain words (`#7 review rev1`), a task is a header line plus
 one `|`-separated row per test (no JSON keys, no quotes), and the whole manual is one
-command (`agent-kanban guide`, about 540 tokens, or 210 to 260 for just one job's part).
+command (`agent-kanban guide`, about 560 tokens, or 210 to 280 for just one job's part).
 See [Token cost](#token-cost) for measured numbers.
 
 Project discovery works like `git`: `agent-kanban init` creates a `.kanban/` directory in
@@ -148,6 +148,7 @@ BOARD
   dump --full > FILE: the whole board for git; load FILE [--replace] restores it
 MAIL
   send NAME TEXT [--task ID] -> sent    inbox -> FROM|[#ID]|TEXT per new message, each shown once; or `no mail`
+  replies to --agent commands end with mail|N while N new messages wait
 In `|` lines \| \\ \n mean | \ and newline.
 ```
 
@@ -160,7 +161,7 @@ own, only lines of the full manual in the same order, so it cannot drift from it
 
 | `guide` | whole | `developer` | `reviewer` | `planning` | `board` |
 |---|---|---|---|---|---|
-| tokens | 541 | 258 (−52%) | 234 (−57%) | 219 (−60%) | 206 (−62%) |
+| tokens | 558 | 275 (−51%) | 251 (−55%) | 236 (−58%) | 206 (−63%) |
 
 Whoever starts an agent can put `agent-kanban guide developer` in its prompt and save about
 280 tokens in every session of that agent.
@@ -191,7 +192,7 @@ again after upgrading `agent-kanban`.
 
 What it costs (`o200k_base`): the description that is in every session is 39 to 65 tokens
 depending on the skill, and the body, which is read only when the skill is used, is the
-guide's 206 to 541.
+guide's 206 to 558.
 
 ## Command reference
 
@@ -228,8 +229,10 @@ without `cd`-ing into it, or for keeping the database somewhere other than
 `.kanban/board.db`. It can go anywhere on the command line.
 
 Who is acting: the commands that claim or finish work, and `send` and `inbox`, take
-`--agent NAME` or read the `AGENT_KANBAN_AGENT` environment variable (the flag wins). Task
-ids are plain numbers; the `#7` spelling that replies use is accepted too.
+`--agent NAME` or read the `AGENT_KANBAN_AGENT` environment variable (the flag wins). While
+mail waits for that agent, the reply of each of them but `inbox` ends with a line `mail|N`
+(N unread messages; see [Mail between agents](#mail-between-agents)). Task ids are plain
+numbers; the `#7` spelling that replies use is accepted too.
 
 ### Replies, errors and exit codes
 
@@ -439,8 +442,26 @@ no mail
 * Mail is kept by name. It survives `agent remove`, and mail for a removed agent waits
   until the name is registered again. A message about a task keeps its `#7` after the task
   is removed; ids are never reused, so it never comes to name another task.
-* Nothing announces new mail yet: an agent sees it when it calls `inbox`. Read mail stays
-  on the board and in [`dump --full`](#keeping-the-board-in-git).
+* Nobody has to ask for news. While mail waits for an agent, the reply to each of its
+  commands that name it (`claim`, `claim-next`, `submit-review`, `approve`,
+  `request-changes`, `release`, `send`) ends with a line `mail|N`, N being the number of
+  unread messages, until `inbox` shows them:
+
+  ```sh
+  $ agent-kanban send alice "Per IP" --task 2 --agent bob
+  sent
+  $ agent-kanban claim-next --agent alice
+  #2 Rate-limit /login
+  0|6th attempt within a minute|6 x POST /login|429
+  mail|1
+  $ agent-kanban inbox --agent alice
+  bob|#2|Per IP
+  ```
+
+  Commands that name nobody (`list`, `show`, `status`, ...) do not count anyone's mail; a
+  lead who only plans calls `inbox` now and then. The note comes from a second look at the
+  board after the command is done, so if that look fails the reply simply has no note.
+* Read mail stays on the board and in [`dump --full`](#keeping-the-board-in-git).
 
 ## Concurrency model
 
@@ -514,7 +535,7 @@ for every field twice, once for the key and once for the quotes and escapes arou
 value. Re-rendering the same fields as labelled text (`status: review`) had made things
 about 10% *worse*; what helps is dropping the labels altogether and fixing the column
 order, which `guide` states once. `claim-next` replaces a "list, pick, claim" round trip
-with one call, and `guide` (about 540 tokens; one job's part about 210–260) replaces
+with one call, and `guide` (about 560 tokens; one job's part about 210–280) replaces
 reading the `--help` screens (about 2,300 tokens in total).
 
 The scenario's board is small. Output that grows with the board is the one cost nothing
@@ -540,11 +561,11 @@ the shell already gives you what is needed, so `agent-kanban` has no flags for i
 
 * **Wait with a bounded loop** when `claim-next` says `idle`, instead of one call per poll.
   This one asks every 20 seconds, five times; it prints the work order as soon as there is
-  one, or the last `idle`, and it ends at once on an error such as an unregistered agent,
-  whose `error: ...` goes to stderr as usual:
+  one, or the last `idle`, and it ends at once on new mail (`idle` then `mail|N`) or on an
+  error such as an unregistered agent, whose `error: ...` goes to stderr as usual:
 
   ```sh
-  for i in $(seq 5); do o=$(agent-kanban claim-next); case "$o" in idle*) sleep 20;; *) break;; esac; done; echo "$o"
+  for i in $(seq 5); do o=$(agent-kanban claim-next); case "$o" in *'mail|'*) break;; idle*) sleep 20;; *) break;; esac; done; echo "$o"
   ```
 
   Keep the total (about 100 s here) below the command time limit of whatever runs the agent

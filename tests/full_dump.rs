@@ -420,7 +420,11 @@ fn work_in_progress_carries_on_after_a_load() {
         "#2 review rev2"
     );
     as_agent("rev", &["claim", "2"]);
-    assert_eq!(as_agent("rev", &["approve", "2"]), "#2 done unblocked:4");
+    // rev's unread mail came along, so the reply notes it.
+    assert_eq!(
+        as_agent("rev", &["approve", "2"]),
+        "#2 done unblocked:4\nmail|1"
+    );
     assert!(as_agent("temp", &["claim", "6"]).starts_with("#6 "));
 }
 

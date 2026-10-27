@@ -205,8 +205,6 @@ mod tests {
                     "submit-review",
                     "--pass",
                     "release",
-                    "send NAME",
-                    "inbox",
                 ],
                 &[
                     "approve",
@@ -226,8 +224,6 @@ mod tests {
                     "|RESULT|EVIDENCE",
                     "approve",
                     "request-changes",
-                    "send NAME",
-                    "inbox",
                 ],
                 &[
                     "submit-review",
@@ -247,8 +243,6 @@ mod tests {
                     "remove ID",
                     "agent register",
                     "--after",
-                    "send NAME",
-                    "inbox",
                 ],
                 &[
                     "claim-next",
@@ -275,14 +269,7 @@ mod tests {
                     "load FILE",
                     "--replace",
                 ],
-                &[
-                    "claim-next",
-                    "submit-review",
-                    "approve",
-                    "add --title",
-                    "send NAME",
-                    "inbox",
-                ],
+                &["claim-next", "submit-review", "approve", "add --title"],
             ),
         ];
         for (part, present, absent) in cases {
@@ -292,6 +279,23 @@ mod tests {
             }
             for needle in absent {
                 assert!(!text.contains(needle), "{part:?} has {needle:?}:\n{text}");
+            }
+        }
+    }
+
+    /// Whoever works on tasks may need mail; whoever only reads the board
+    /// does not.
+    #[test]
+    fn mail_comes_with_every_part_but_the_board() {
+        for part in Part::value_variants() {
+            let text = text(Some(*part));
+            let wanted = !matches!(part, Part::Board);
+            for needle in ["send NAME", "inbox", "mail|N"] {
+                assert_eq!(
+                    text.contains(needle),
+                    wanted,
+                    "{part:?} {needle:?}:\n{text}"
+                );
             }
         }
     }

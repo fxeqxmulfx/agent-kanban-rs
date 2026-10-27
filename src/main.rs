@@ -307,6 +307,37 @@ enum Command {
     },
 }
 
+impl Command {
+    /// Who acts, for the commands whose reply notes the actor's unread mail:
+    /// every command that names its agent except `inbox`, which hands the
+    /// mail over itself.
+    const fn actor(&self) -> Option<&Who> {
+        match self {
+            Self::Claim { who, .. }
+            | Self::ClaimNext { who, .. }
+            | Self::SubmitReview { who, .. }
+            | Self::Approve { who, .. }
+            | Self::RequestChanges { who, .. }
+            | Self::Release { who, .. }
+            | Self::Send { who, .. } => Some(who),
+            Self::Inbox { .. }
+            | Self::Init
+            | Self::Guide { .. }
+            | Self::Skill { .. }
+            | Self::Agent { .. }
+            | Self::Add { .. }
+            | Self::List { .. }
+            | Self::Show { .. }
+            | Self::Dump { .. }
+            | Self::Load { .. }
+            | Self::Edit { .. }
+            | Self::Remove { .. }
+            | Self::Status
+            | Self::Move { .. } => None,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AgentAction {
     /// Register an agent name
@@ -344,6 +375,18 @@ fn group(values: &[String], size: usize) -> Vec<Vec<String>> {
 }
 
 fn run(command: Command) -> Result<String> {
+    let actor = command
+        .actor()
+        .and_then(|who| who.name().ok())
+        .map(str::to_owned);
+    let reply = dispatch(command)?;
+    Ok(match actor {
+        Some(me) => commands::mail::noted(reply, &me),
+        None => reply,
+    })
+}
+
+fn dispatch(command: Command) -> Result<String> {
     match command {
         Command::Init => commands::init(),
         Command::Guide { part } => Ok(commands::guide::text(part)),

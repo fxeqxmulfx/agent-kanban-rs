@@ -1,6 +1,7 @@
 //! Mail between agents: `send NAME TEXT [--task ID]` leaves a message on the
 //! board, and `inbox` hands an agent its new messages, oldest first, each one
-//! once. Agents that share a board and nothing else talk this way.
+//! once; until then, the replies to that agent's other commands end with
+//! `mail|N`. Agents that share a board and nothing else talk this way.
 
 mod common;
 
@@ -158,6 +159,104 @@ fn mail_outlives_the_agents_and_tasks_it_names() {
     assert_eq!(inbox(&dir, "temp"), "rev|#1|thanks");
     // Ids are never reused, so the #1 of that mail names no other task.
     assert_eq!(add_task(&dir, "after", "low"), 2);
+}
+
+/// `reply` without its last line, which must be the mail notice `mail|N`.
+fn before_notice(reply: &str, count: u32) -> &str {
+    reply
+        .strip_suffix(&format!("\nmail|{count}"))
+        .unwrap_or_else(|| panic!("no mail|{count} at the end of:\n{reply}"))
+}
+
+/// Every command that names its agent, except `inbox` itself, ends its reply
+/// with `mail|N` while N messages wait for that agent: nobody has to call
+/// `inbox` just to find out.
+#[test]
+fn replies_note_unread_mail_until_inbox_shows_it() {
+    let dir = board();
+    let developer = |args: &[&str]| run(&dir, &[args, &["--agent", "dev"]].concat());
+    let reviewer = |args: &[&str]| run(&dir, &[args, &["--agent", "rev"]].concat());
+
+    assert_eq!(developer(&["claim-next"]), "#1 Login\n0|works|in|out");
+    send(&dir, "rev", &["dev", "is it per IP?", "--task", "1"]);
+    assert_eq!(
+        before_notice(&developer(&["claim", "1"]), 1),
+        "#1 Login\n0|works|in|out"
+    );
+    send(&dir, "rev", &["dev", "or per user?"]);
+    assert_eq!(
+        before_notice(&developer(&["release", "1"]), 2),
+        "#1 in_progress"
+    );
+    assert_eq!(
+        before_notice(&developer(&["claim-next"]), 2),
+        "#1 Login\n0|works|in|out"
+    );
+    assert_eq!(
+        before_notice(&developer(&["send", "rev", "which?"]), 2),
+        "sent"
+    );
+    assert_eq!(
+        before_notice(&developer(&["submit-review", "1", "--pass", "0", "ok"]), 2),
+        "#1 review rev1"
+    );
+    assert_eq!(
+        inbox(&dir, "dev"),
+        "rev|#1|is it per IP?\nrev||or per user?",
+        "inbox shows the mail instead of noting it"
+    );
+
+    assert_eq!(
+        before_notice(&reviewer(&["claim-next"]), 1),
+        "#1 rev1 Login\n0|works|in|out|passed|ok"
+    );
+    assert_eq!(
+        before_notice(&reviewer(&["request-changes", "1", "--notes", "say"]), 1),
+        "#1 in_progress"
+    );
+    assert_eq!(inbox(&dir, "rev"), "dev||which?");
+
+    // Once read, mail is no longer noted.
+    assert_eq!(
+        developer(&["claim-next"]),
+        "#1 rev1 Login\nchanges|say\n0|works|in|out"
+    );
+    developer(&["submit-review", "1", "--pass", "0", "per IP"]);
+    assert_eq!(developer(&["send", "rev", "per IP"]), "sent");
+    reviewer(&["claim-next"]);
+    assert_eq!(before_notice(&reviewer(&["approve", "1"]), 1), "#1 done");
+    assert_eq!(inbox(&dir, "rev"), "dev||per IP");
+}
+
+/// Only a command that names its agent knows whose mail to count. The others
+/// print what they always print, even when the environment names an agent,
+/// and a refused command prints nothing but its error.
+#[test]
+fn commands_that_name_nobody_do_not_note_mail() {
+    let dir = board();
+    send(&dir, "dev", &["rev", "hi"]);
+
+    for args in [
+        &["list"][..],
+        &["show", "1"],
+        &["status"],
+        &["agent", "list"],
+    ] {
+        let output = kanban(&dir)
+            .env("AGENT_KANBAN_AGENT", "rev")
+            .args(args)
+            .output()
+            .unwrap();
+        let reply = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{args:?}");
+        assert!(!reply.contains("mail|"), "{args:?}: {reply}");
+    }
+    assert_eq!(
+        fail(&dir, &["approve", "1", "--agent", "rev"]),
+        "error: task 1 is todo; approve needs review"
+    );
+
+    assert_eq!(inbox(&dir, "rev"), "dev||hi");
 }
 
 /// Agents send and read at once: every message arrives, and none twice,

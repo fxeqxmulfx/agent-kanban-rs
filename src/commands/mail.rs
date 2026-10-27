@@ -5,11 +5,34 @@
 //! `agent remove` keeps it, and whoever registers the name again finds what
 //! was left for it. A message may name the task it is about; ids are never
 //! reused, so its `#7` stays right even after that task is removed.
+//!
+//! Nobody has to ask for news: the reply to a command that names its agent
+//! ends with `mail|N` while N messages wait for that agent (see [`noted`]).
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::{lifecycle, view};
+
+/// `reply`, plus a last line `mail|N` when `me` has N unread messages.
+///
+/// The command behind `reply` is already done, so a count that cannot be
+/// read leaves the reply as it is: failing here would tell the agent that a
+/// finished command failed. The next reply notes the mail instead.
+pub fn noted(reply: String, me: &str) -> String {
+    match crate::db::open_existing().and_then(|conn| unread(&conn, me)) {
+        Ok(count) if count > 0 => format!("{reply}\nmail|{count}"),
+        _ => reply,
+    }
+}
+
+fn unread(conn: &Connection, me: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE recipient = ?1 AND read_at IS NULL",
+        [me],
+        |row| row.get(0),
+    )?)
+}
 
 /// `send NAME TEXT [--task ID]` -> `sent`.
 pub fn send(from: &str, to: &str, text: &str, task: Option<i64>) -> Result<String> {
@@ -143,6 +166,25 @@ mod tests {
 
         assert_eq!(inbox_inner(&conn, "alice").unwrap(), "bob||for alice");
         assert_eq!(inbox_inner(&conn, "bob").unwrap(), "alice||for bob");
+    }
+
+    #[test]
+    fn unread_counts_what_inbox_has_not_shown_yet() {
+        let conn = setup();
+        assert_eq!(unread(&conn, "bob").unwrap(), 0);
+
+        send_inner(&conn, "alice", "bob", "one", None).unwrap();
+        send_inner(&conn, "alice", "bob", "two", Some(1)).unwrap();
+        send_inner(&conn, "bob", "alice", "for alice", None).unwrap();
+        assert_eq!(unread(&conn, "bob").unwrap(), 2);
+
+        inbox_inner(&conn, "bob").unwrap();
+        assert_eq!(unread(&conn, "bob").unwrap(), 0);
+        assert_eq!(
+            unread(&conn, "alice").unwrap(),
+            1,
+            "alice has not read hers"
+        );
     }
 
     #[test]

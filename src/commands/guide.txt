@@ -20,4 +20,5 @@ BOARD
   dump --full > FILE: the whole board for git; load FILE [--replace] restores it
 MAIL
   send NAME TEXT [--task ID] -> sent    inbox -> FROM|[#ID]|TEXT per new message, each shown once; or `no mail`
+  replies to --agent commands end with mail|N while N new messages wait
 In `|` lines \| \\ \n mean | \ and newline.
